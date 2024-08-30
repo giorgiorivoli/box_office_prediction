@@ -1,0 +1,399 @@
+---
+title: "4. Prediction Models"
+author: "Giorgio Rivoli"
+date: "2024-08-26"
+output: html_document
+---
+
+We will now develop various models to make predictions on our dataset. Our goal is to determine whether a movie will be able to gross at least three times its budget. We have set this threshold based on the unofficial "rule of x3" in the film industry. According to this rule, a movie must cover not only production costs, which can include expenses for sets or actors' fees, but also additional charges such as marketing expenses, incurred after the film is made. Moreover, a movie's earnings are not entirely allocated to the producers but must be shared with other stakeholders, such as cinema owners or distributors. For these reasons, a movie can be considered profitable if its revenues exceed about three times the production budget.
+
+For our analysis, we will use several models, including Ridge and LASSO, Random Forest, and Extreme Gradient Boosting. First, we will import our dataset, previously prepared in the file "3. EDA.Rmd". Next, we will implement some Feature Engineering techniques to enrich the dataset with new variables that could enhance the accuracy of the analysis.
+
+We will then proceed to balance the dataset using the oversampling technique, as the classes are uneven: about 68% of our observations are classified as "unprofitable," with a revenue-to-budget ratio of less than 3, while only 32% are considered "profitable." Such an imbalance can cause significant distortions in the analysis.
+
+After balancing the dataset, we will apply the various algorithms and evaluate their performance, subsequently comparing the results of each model.
+
+The following code will perform these operations, starting with the Ridge and LASSO models.
+
+```{r}
+# Loading necessary libraries for data manipulation, statistical modeling, and visualization
+library(glmnet)       # For ridge and LASSO regression
+library(readxl)       # For reading Excel files
+library(caret)        # For creating confusion matrices and other model training tasks
+library(tidyverse)    # For data manipulation and visualization
+library(dplyr)        # For data manipulation
+library(ROSE)         # For handling imbalanced data through oversampling
+
+# Loading the dataset from an Excel file
+final_dataset <- read_excel("final_dataset.xlsx")
+
+# Log transforming budget and revenue, creating new variables for analysis
+final_dataset <- final_dataset %>% 
+  mutate(
+    log_budget = log1p(budget),  # Applying log(1+x) transformation to budget
+    Star1_rev_log = log(Star1_rev + 1),  # Log transforming revenue of star 1
+    Star2_rev_log = log(Star2_rev + 1),  # Log transforming revenue of star 2
+    Director_rev_log = log(Director_rev + 1),  # Log transforming director's revenue
+    budget_per_minute = budget / runtime,  # Calculating budget per minute of runtime
+    Star_popularity = Star1_pop + Star2_pop,  # Summing popularity of two stars
+    star_power = Star1_rev + Star2_rev + Director_rev,  # Calculating combined star power
+    cast_crew_popularity = Star1_pop + Star2_pop + Director_pop,  # Sum of popularity of cast and crew
+    star_vote = (Star1_vote + Star2_vote + Director_vote) / 3,  # Average votes of stars
+    gender_disparity = abs(Star_gender1 - Star_gender2),  # Absolute difference in gender representation
+    star_budget_power = star_power * log_budget,  # Interaction term between star power and budget
+    ip_collection = IP * belongs_to_collection,  # Interaction between intellectual property and collection membership
+    potential_profit = (log_budget / runtime) * average_cpi,  # Calculated potential profit
+    popularity_budget_interaction = Star_popularity * budget / runtime,  # Interaction between star popularity and budget per runtime
+    star_power_ip_interaction = (Star1_rev + Star2_rev + Director_rev) * IP,  # Interaction between star power and IP
+    Star_popularity_budget = Star_popularity * budget,  # Interaction between star popularity and budget
+    Star_popularity_runtime = Star_popularity * runtime,  # Interaction between star popularity and runtime
+    Star_popularity_IP = Star_popularity * IP,  # Interaction between star popularity and IP
+    budget_runtime = budget * runtime,  # Product of budget and runtime
+    budget_IP = budget * IP,  # Product of budget and IP
+    runtime_IP = runtime * IP  # Product of runtime and IP
+  ) %>%
+  mutate(across(c(Star_popularity, budget, runtime, IP), ~ .^2, .names = "{.col}_squared")) |>  # Squaring selected columns for nonlinear effects
+  mutate(worth = ifelse(revenue / budget >= 3, 1, 0)) |>  # Creating binary outcome variable for high profit
+  select(-title)  # Removing the title column from the dataset
+
+# Setting seed for reproducibility in random operations
+set.seed(123)
+
+# Creating folds for cross-validation with k=5
+folds <- createFolds(final_dataset$revenue, k = 5)
+final_dataset$month_encoded <- NA
+for(i in 1:5) {
+  fold_train <- final_dataset[-folds[[i]], ]
+  fold_valid <- final_dataset[folds[[i]], ]
+  month_mean <- fold_train %>%
+    group_by(month) %>%
+    summarise(month_target_mean = mean(revenue))
+  fold_valid <- fold_valid %>%
+    left_join(month_mean, by = "month") %>%
+    mutate(month_encoded = month_target_mean)
+  final_dataset[folds[[i]], "month_encoded"] <- fold_valid$month_encoded
+}
+final_dataset <- final_dataset %>% 
+  select(-c(month, revenue))
+
+# Oversampling using ROSE's ovun.sample method on the whole dataset to address class imbalance
+balanced_data <- ovun.sample(worth ~ ., data = final_dataset, method = "over", N = 2 * sum(final_dataset$worth == 0))$data
+
+# Splitting the balanced dataset into training (80%) and testing (20%) sets
+train_size <- floor(0.8 * nrow(balanced_data))
+train_indices <- sample(seq_len(nrow(balanced_data)), size = train_size)
+
+train <- balanced_data[train_indices, ]
+test <- balanced_data[-train_indices, ]
+
+# Creating input matrices and target vectors for modeling
+x_train = as.matrix(train %>% select(-worth))
+y_train = train$worth
+
+x_test = as.matrix(test %>% select(-worth))
+y_test = test$worth
+
+# Training Ridge and LASSO regression models using cross-validation to select the best lambda
+ridge_mod = cv.glmnet(x_train, y_train, alpha = 0, family = "binomial")
+best_lambda_ridge = ridge_mod$lambda.min
+lasso_mod = cv.glmnet(x_train, y_train, alpha = 1, family = "binomial")
+best_lambda_lasso = lasso_mod$lambda.min
+
+# Making predictions on test data using the selected best lambda values
+ridge_pred = predict(ridge_mod, s = best_lambda_ridge, newx = x_test, type = "response")
+lasso_pred = predict(lasso_mod, s = best_lambda_lasso, newx = x_test, type = "response")
+
+# Converting predictions to binary outcomes (0 or 1) using a threshold of 0.5
+ridge_pred_binary = ifelse(ridge_pred >= 0.5, 1, 0)
+lasso_pred_binary = ifelse(lasso_pred >= 0.5, 1, 0)
+
+# Function to calculate and print model metrics without Recall
+calculate_and_print_metrics <- function(pred, actual, model_name) {
+  confusion_matrix = confusionMatrix(factor(pred), factor(actual))
+
+  print(paste(model_name, "Model Metrics:"))
+  print("Confusion Matrix:")
+  print(confusion_matrix$table)
+
+  accuracy = confusion_matrix$overall['Accuracy']
+  precision = confusion_matrix$byClass['Pos Pred Value']
+  sensitivity = confusion_matrix$byClass['Sensitivity']
+  f1_score = confusion_matrix$byClass['F1']
+  specificity = confusion_matrix$byClass['Specificity']
+
+  print(paste("Accuracy:", round(accuracy, 4)))
+  print(paste("Precision:", round(precision, 4)))
+  print(paste("F1 Score:", round(f1_score, 4)))
+  print(paste("Sensitivity:", round(sensitivity, 4)))
+  print(paste("Specificity:", round(specificity, 4)))
+
+  cat("\n")  # Adding a blank line for better readability
+}
+
+# Calculate and print metrics for the Ridge model
+calculate_and_print_metrics(ridge_pred_binary, y_test, "Ridge")
+
+# Calculate and print metrics for the LASSO model
+calculate_and_print_metrics(lasso_pred_binary, y_test, "LASSO")
+```
+
+In analyzing the results obtained from the Ridge and LASSO models, a picture of very similar performances emerges, with some subtle differences that warrant careful consideration. The Ridge model shows a slightly higher accuracy (68.46%) compared to the LASSO model (68.33%). Although minimal, this difference suggests that Ridge might have a marginally better capacity to correctly classify instances in the overall dataset. Looking at precision, we notice a substantial equivalence between the two models, with Ridge achieving 66.69% and LASSO 66.67%. This indicates that when the models predict a positive outcome, the probability that it is indeed positive is nearly identical for both. The F1 score, which provides a balanced synthesis of precision and sensitivity, is slightly higher for the Ridge model (69.02%) compared to LASSO (68.81%). This suggests that Ridge might offer a better balance between these two important metrics. Regarding sensitivity, the Ridge model (71.51%) slightly surpasses LASSO (71.09%). This implies that Ridge is a bit more effective at correctly identifying positive cases, showing a greater ability to capture true positives in the dataset. Finally, in terms of specificity, contrary to what the general trend might suggest, the LASSO model (65.67%) shows a slight advantage over Ridge (65.50%). Although minimal, this difference indicates that LASSO is marginally more precise in correctly identifying negative cases.
+
+Let's proceed with the Random Forest model.
+
+```{r}
+library(randomForest)   # For random forest modeling
+
+# Loading and preparing the data
+final_dataset <- read_excel("final_dataset.xlsx")  
+
+# Log transformation of budget and revenue, and creation of new variables for modeling
+final_dataset <- final_dataset %>% 
+  mutate(
+    log_budget = log1p(budget),  
+    Star1_rev_log = log(Star1_rev + 1),  
+    Star2_rev_log = log(Star2_rev + 1),  
+    Director_rev_log = log(Director_rev + 1),  
+    budget_per_minute = budget / runtime,  
+    Star_popularity = Star1_pop + Star2_pop,  
+    star_power = Star1_rev + Star2_rev + Director_rev,  
+    cast_crew_popularity = Star1_pop + Star2_pop + Director_pop,  
+    star_vote = (Star1_vote + Star2_vote + Director_vote) / 3,  
+    gender_disparity = abs(Star_gender1 - Star_gender2),  
+    star_budget_power = star_power * log_budget,  
+    ip_collection = IP * belongs_to_collection,  
+    potential_profit = (log_budget / runtime) * average_cpi,  
+    popularity_budget_interaction = Star_popularity * budget / runtime,  
+    star_power_ip_interaction = (Star1_rev + Star2_rev + Director_rev) * IP,  
+    Star_popularity_budget = Star_popularity * budget,  
+    Star_popularity_runtime = Star_popularity * runtime,  
+    Star_popularity_IP = Star_popularity * IP,  
+    budget_runtime = budget * runtime,  
+    budget_IP = budget * IP,  
+    runtime_IP = runtime * IP  
+  ) %>%
+  mutate(across(c(Star_popularity, budget, runtime, IP), ~ .^2, .names = "{.col}_squared")) |>  
+  mutate(worth = ifelse(revenue / budget >= 3, 1, 0)) |>  
+  select(-title)  
+
+# Encoding the 'month' variable with the mean revenue of the respective month from cross-validation folds
+set.seed(123)  
+folds <- createFolds(final_dataset$revenue, k = 5)  
+final_dataset$month_encoded <- NA
+for(i in 1:5) {
+  fold_train <- final_dataset[-folds[[i]], ]
+  fold_valid <- final_dataset[folds[[i]], ]
+  month_mean <- fold_train %>%
+    group_by(month) %>%
+    summarise(month_target_mean = mean(revenue))  
+  fold_valid <- fold_valid %>%
+    left_join(month_mean, by = "month") %>%
+    mutate(month_encoded = month_target_mean)  
+  final_dataset[folds[[i]], "month_encoded"] <- fold_valid$month_encoded
+}
+final_dataset <- final_dataset %>% 
+  select(-c(month, revenue))  
+
+
+final_dataset$worth <- factor(final_dataset$worth)
+
+
+balanced_data <- ovun.sample(worth ~ ., data = final_dataset, method = "over", N = 2 * sum(final_dataset$worth == 0))$data
+
+# Checking the new class distribution
+print(prop.table(table(balanced_data$worth)))  
+
+# Splitting the data into training and testing sets with 75% of data used for training
+train_indices <- createDataPartition(balanced_data$worth, p = 0.75, list = FALSE)
+train <- balanced_data[train_indices, ]
+test <- balanced_data[-train_indices, ]
+
+# Optimizing the mtry parameter for the random forest model
+tuned_rf <- tuneRF(
+  x = train[, -which(names(train) %in% c("worth", "revenue", "log_revenue"))],  # Features for tuning
+  y = train$worth,  # Target variable
+  ntreeTry = 500,  # Number of trees to try
+  stepFactor = 1.5,  # Step factor for tuning
+  improve = 0.01,  # Improvement threshold
+  trace = TRUE,  # Print updates during tuning
+  plot = FALSE  # Do not plot tuning process
+)
+
+# Extracting the best mtry value
+best_mtry <- tuned_rf[which.min(tuned_rf[, 2]), 1]
+
+# Training the final random forest model with the optimized mtry
+model <- randomForest(
+  worth ~ ., 
+  data = train, 
+  importance = TRUE, 
+  ntree = 1000,
+  mtry = best_mtry
+)
+
+# Evaluating the model using the test data
+predictions <- predict(model, newdata = test)
+conf_matrix <- confusionMatrix(predictions, test$worth)
+
+# Displaying the confusion matrix
+print("Confusion Matrix:")
+print(conf_matrix$table)
+
+# Calculating and displaying evaluation metrics
+accuracy <- conf_matrix$overall["Accuracy"]
+precision <- conf_matrix$byClass["Precision"]
+f1_score <- conf_matrix$byClass["F1"]
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+specificity <- conf_matrix$byClass["Specificity"]
+
+# Printing the metrics
+print(paste("Accuracy:", round(accuracy, 4)))
+print(paste("Precision:", round(precision, 4)))
+print(paste("F1 Score:", round(f1_score, 4)))
+print(paste("Sensitivity:", round(sensitivity, 4)))
+print(paste("Specificity:", round(specificity, 4)))
+```
+
+The analysis of the Random Forest model reveals significantly better performance compared to the previously examined Ridge and LASSO models. The optimization process for the mtry parameter identified an optimal value of 12, which produced the lowest Out-of-Bag (OOB) error of 13.23%. This result suggests good model calibration, effectively balancing complexity and generalization. The performance metrics of the model are very good, with an accuracy of 87.61%, indicating that the model correctly classifies nearly 90% of the instances. The precision is high and well-balanced at 89.35%. An F1 score of 0.8733 confirms the balance between precision and sensitivity. A specificity of 89.82% indicates a strong capability of the model to correctly identify negative cases, while the sensitivity is at 85.39%.
+
+We then conclude with the XGBoost model. 
+
+```{r}
+# Loading necessary libraries
+library(xgboost)   # For using the XGBoost machine learning algorithm
+library(Matrix)    # For handling sparse and dense matrix types which are often required by xgboost
+
+# Loading and preparing the data
+final_dataset <- read_excel("final_dataset.xlsx")  
+
+# Logarithmic transformation of budget and revenue and creation of new variables
+final_dataset <- final_dataset %>% 
+  mutate(
+    log_budget = log1p(budget),  
+    Star1_rev_log = log(Star1_rev + 1), 
+    Star2_rev_log = log(Star2_rev + 1),  
+    Director_rev_log = log(Director_rev + 1),  
+    budget_per_minute = budget / runtime,  
+    Star_popularity = Star1_pop + Star2_pop,  
+    star_power = Star1_rev + Star2_rev + Director_rev,  
+    cast_crew_popularity = Star1_pop + Star2_pop + Director_pop,  
+    star_vote = (Star1_vote + Star2_vote + Director_vote) / 3,  
+    gender_disparity = abs(Star_gender1 - Star_gender2),  
+    star_budget_power = star_power * log_budget,  
+    ip_collection = IP * belongs_to_collection,  
+    potential_profit = (log_budget / runtime) * average_cpi,  
+    popularity_budget_interaction = Star_popularity * budget / runtime,  
+    star_power_ip_interaction = (Star1_rev + Star2_rev + Director_rev) * IP,  
+    Star_popularity_budget = Star_popularity * budget,  
+    Star_popularity_runtime = Star_popularity * runtime,  
+    Star_popularity_IP = Star_popularity * IP,  
+    budget_runtime = budget * runtime,  
+    budget_IP = budget * IP,  
+    runtime_IP = runtime * IP  
+  ) %>%
+  mutate(across(c(Star_popularity, budget, runtime, IP), ~ .^2, .names = "{.col}_squared")) |>  
+  mutate(worth = ifelse(revenue / budget >= 3, 1, 0)) |>  
+  select(-title)  
+
+# Encoding the 'month' variable using mean revenue of each month from cross-validation folds
+set.seed(123)  
+folds <- createFolds(final_dataset$revenue, k = 5)  
+final_dataset$month_encoded <- NA  
+for(i in 1:5) {
+  fold_train <- final_dataset[-folds[[i]], ]
+  fold_valid <- final_dataset[folds[[i]], ]
+  month_mean <- fold_train %>%
+    group_by(month) %>%
+    summarise(month_target_mean = mean(revenue))  
+  fold_valid <- fold_valid %>%
+    left_join(month_mean, by = "month") %>%
+    mutate(month_encoded = month_target_mean)  
+  final_dataset[folds[[i]], "month_encoded"] <- fold_valid$month_encoded
+}
+final_dataset <- final_dataset %>% 
+  select(-c(month, revenue))  
+
+# Converting 'worth' to a factor for classification
+final_dataset$worth <- as.factor(final_dataset$worth)
+
+# Applying undersampling to balance the dataset
+balanced_data <- ovun.sample(worth ~ ., data = final_dataset, method = "over", N = 2 * sum(final_dataset$worth == 0))$data
+
+# Checking the new class distribution
+print(prop.table(table(balanced_data$worth)))  
+
+# Splitting data into training and testing sets (75% training, 25% testing)
+train_indices <- createDataPartition(balanced_data$worth, p = 0.75, list = FALSE)
+train <- balanced_data[train_indices, ]
+test <- balanced_data[-train_indices, ]
+
+# Preparing data for XGBoost
+train_x <- train %>% select(-worth)  # Feature matrix for training
+train_y <- as.numeric(train$worth) - 1  # Numeric conversion of target variable for training
+test_x <- test %>% select(-worth)  # Feature matrix for testing
+test_y <- as.numeric(test$worth) - 1  # Numeric conversion of target variable for testing
+
+# Function to convert factors to numeric values
+factor_to_numeric <- function(x) {
+  if(is.factor(x)) as.numeric(as.factor(x)) - 1
+  else x
+}
+
+# Applying the conversion to training and testing feature matrices
+train_x <- train_x %>% 
+  mutate_if(is.character, as.factor) %>%
+  mutate_all(factor_to_numeric)
+test_x <- test_x %>% 
+  mutate_if(is.character, as.factor) %>%
+  mutate_all(factor_to_numeric)
+
+# Creating DMatrix objects for XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(train_x), label = train_y)
+dtest <- xgb.DMatrix(data = as.matrix(test_x), label = test_y)
+
+# Defining XGBoost parameters
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.3,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+# Training the XGBoost model
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+# Making predictions
+predictions_prob <- predict(xgb_model, dtest)
+predictions <- as.factor(ifelse(predictions_prob > 0.5, 1, 0))
+
+# Creating and displaying the confusion matrix
+conf_matrix <- confusionMatrix(predictions, as.factor(test_y))
+print("Confusion Matrix:")
+print(conf_matrix$table)
+
+# Calculating and printing evaluation metrics
+accuracy <- conf_matrix$overall["Accuracy"]
+precision <- conf_matrix$byClass["Precision"]
+f1_score <- conf_matrix$byClass["F1"]
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+specificity <- conf_matrix$byClass["Specificity"]
+
+# Printing the evaluation metrics
+print(paste("Accuracy:", round(accuracy, 4)))
+print(paste("Precision:", round(precision, 4)))
+print(paste("F1 Score:", round(f1_score, 4)))
+print(paste("Sensitivity:", round(sensitivity, 4)))
+print(paste("Specificity:", round(specificity, 4)))
+```
+
+The performance analysis of the XGBoost model reveals solid results, although slightly inferior to the previously examined Random Forest model. With an accuracy of 83.77%, the XGBoost model demonstrates good overall classification ability, successfully predicting the "worth" of movies in more than four out of five cases. A precision of 86.6% indicates that when the model predicts a movie as "worth," it has a high success rate. An F1 score of 0.8312 suggests a good balance between precision and sensitivity, confirming the overall robustness of the model. The sensitivity (79.91%) and specificity (87.64%) are well-balanced, with a slight tendency towards the correct identification of negative cases. This might indicate the model's caution in classifying films as "worth," preferring to avoid false positives.
+

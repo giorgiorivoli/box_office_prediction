@@ -1,0 +1,180 @@
+---
+title: '1. Data Harvesting - TMDB API'
+author: "Giorgio Rivoli"
+date: "2024-07-15"
+output: html_document
+---
+
+# Data Collection Process
+
+The starting point of our analysis is the collection of film-related data using the [TMDB (The Movie Database)](https://www.themoviedb.org/) API. TMDB provides comprehensive [documentation](https://developer.themoviedb.org/docs/getting-started) that explains how to use the API to access detailed information about films. Although the most straightforward method to obtain this data would be to request all the available pages, this approach has a [significant limitation](https://www.themoviedb.org/talk/621b62abd18572001df182ea): the API allows access only to the first 500 pages, each containing 20 films, for a total of 10,000 films.
+
+However, our primary objective is to collect data for all the films available in the TMDB database without being restricted by this predefined limit. To overcome this constraint, we adopted a different approach, leveraging the unique numeric ID assigned to each film. In TMDB, each film is identified by an integer starting from 1, which increases progressively for every new film added. Our method, therefore, involves iteratively searching for films starting from ID 1, then ID 2, ID 3, and so on.
+
+The search process continues until a specified number of consecutive unsuccessful attempts is reached, which we set to 10,000. This stopping criterion was introduced to ensure operational efficiency, as a large number of consecutive IDs not associated with any films indicates that we have effectively reached the end of the database. This approach allowed us to achieve a broader and more comprehensive coverage of the films available on TMDB.
+
+Below is the code used to implement this data collection:
+
+```{r}
+# Loading the necessary libraries
+library(httr)        # Library for making HTTP requests
+library(jsonlite)    # Library for handling and converting JSON data
+library(dplyr)       # Library for data manipulation and analysis
+library(openxlsx)    # Library for creating and handling Excel files
+
+# TMDB API Key
+api_key <- "0114e85d1048efca056a34d5022b2bdf" # Personal API key for authenticating requests
+movie_details_url <- "https://api.themoviedb.org/3/movie/" # Base URL for retrieving movie details from the TMDB API
+
+# Function to check and fetch movie details by ID
+fetch_movie_by_id <- function(movie_id) {
+  # The tryCatch block handles potential errors during the API request and data processing
+  tryCatch({
+    # Make a GET request to fetch movie details from the TMDB API
+    response <- GET(paste0(movie_details_url, movie_id), query = list(api_key = api_key, append_to_response = "keywords,credits,releases"))
+    
+    # Check if the API response is successful (status code 200)
+    if (status_code(response) == 200) {
+      # Parse the JSON response into a text format and then convert it to an R list
+      movie <- content(response, "text", encoding = "UTF-8")
+      movie <- fromJSON(movie, flatten = TRUE)
+      
+      # Extract keywords
+      keywords <- if (!is.null(movie$keywords$keywords)) paste(movie$keywords$keywords$name, collapse = ", ") else NA
+      
+      # Extract collection information (if the movie belongs to a collection)
+      belongs_to_collection <- if (!is.null(movie$belongs_to_collection)) movie$belongs_to_collection$name else NA
+      
+      # Extract genres
+      genres <- if (!is.null(movie$genres)) paste(movie$genres$name, collapse = ", ") else NA
+      
+      # Extract production companies
+      production_companies <- if (!is.null(movie$production_companies)) paste(movie$production_companies$name, collapse = ", ") else NA
+      
+      # Extract production countries
+      production_countries <- if (!is.null(movie$production_countries)) paste(movie$production_countries$name, collapse = ", ") else NA
+      
+      # Extract spoken languages
+      spoken_languages <- if (!is.null(movie$spoken_languages)) paste(movie$spoken_languages$name, collapse = ", ") else NA
+      
+      # Extract cast information
+      cast <- if (!is.null(movie$credits$cast)) paste(movie$credits$cast$name, collapse = ", ") else NA
+      
+      # Extract cast genders
+      cast_genders <- if (!is.null(movie$credits$cast)) paste(movie$credits$cast$gender, collapse = ", ") else NA
+      
+      # Extract crew information
+      crew <- if (!is.null(movie$credits$crew)) paste(movie$credits$crew$name, collapse = ", ") else NA
+      
+      # Extract crew genders
+      crew_genders <- if (!is.null(movie$credits$crew)) paste(movie$credits$crew$gender, collapse = ", ") else NA
+      
+      # Extract crew jobs roles
+      jobs <- if (!is.null(movie$credits$crew)) paste(movie$credits$crew$job, collapse = ", ") else NA
+      
+      # Extract certification for US market
+      certification <- NA
+      if (!is.null(movie$releases) && !is.null(movie$releases$countries)) {
+        countries_df <- as.data.frame(movie$releases$countries)
+        if ("iso_3166_1" %in% colnames(countries_df)) {
+          us_release <- countries_df %>% filter(iso_3166_1 == "US")
+          if (nrow(us_release) > 0) {
+            certification <- us_release$certification[1]
+          }
+        }
+      }
+      
+      # Return the extracted movie details as a data frame
+      return(data.frame(
+        id = movie$id, 
+        original_title = movie$original_title, 
+        title = movie$title, 
+        budget = movie$budget, 
+        revenue = movie$revenue,
+        release_date = movie$release_date,
+        vote_count = movie$vote_count,
+        vote_average = movie$vote_average,
+        popularity = movie$popularity,
+        overview = movie$overview,
+        original_language = movie$original_language,
+        runtime = movie$runtime,
+        tagline = movie$tagline,
+        keywords = keywords,
+        belongs_to_collection = belongs_to_collection,
+        genres = genres,
+        production_companies = production_companies,
+        production_countries = production_countries,
+        spoken_languages = spoken_languages,
+        cast = cast,
+        crew = crew,
+        jobs = jobs,
+        cast_genders = cast_genders,
+        crew_genders = crew_genders,
+        certification = certification,
+        stringsAsFactors = FALSE
+      ))
+    } else {
+      # Return NULL if the status code is not 200
+      return(NULL)
+    }
+  }, error = function(e) {
+    # The error block catches any issues (e.g., network errors, JSON parsing errors)
+    # and returns NULL instead of stopping the execution
+    return(NULL)
+  })
+}
+
+# Function to find and collect movies by ID up to a certain limit
+collect_movies_up_to_id <- function(max_attempts) {
+  # Create an empty data frame to store all movie details
+  all_movies <- data.frame(
+    id = integer(), original_title = character(), title = character(), budget = numeric(), revenue = numeric(), 
+    release_date = character(), vote_count = integer(), vote_average = numeric(), popularity = numeric(), 
+    overview = character(), original_language = character(), runtime = integer(), tagline = character(), 
+    keywords = character(), belongs_to_collection = character(), genres = character(), 
+    production_companies = character(), production_countries = character(), spoken_languages = character(), 
+    cast = character(), crew = character(), jobs = character(), cast_genders = character(), 
+    crew_genders = character(), certification = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  missing_count <- 0 # Counter for consecutive missing movie IDs
+  movie_id <- 1 # Start searching from movie ID 1
+  
+  # Loop until the number of missing movie IDs reaches the maximum limit
+  while (missing_count < max_attempts) {
+    movie <- fetch_movie_by_id(movie_id) # Attempt to fetch movie details by ID
+    if (!is.null(movie)) {
+      # If movie is found, add it to the collected movies data frame
+      all_movies <- bind_rows(all_movies, movie)
+      print(paste("Movie found with ID:", movie_id))
+      missing_count <- 0 # Reset the missing count when a movie is found
+    } else {
+      # If no movie is found, increment the missing count
+      missing_count <- missing_count + 1
+      print(paste("Movies not found:", missing_count)) # Print the missing count
+    }
+    movie_id <- movie_id + 1 # Move to the next movie ID
+    Sys.sleep(0.1) # Add a small delay to avoid hitting API rate limits
+  }
+  
+  # Return the complete collection of movies found
+  return(all_movies)
+}
+
+# Collect movies, stopping after encountering 10,000 consecutive missing IDs
+collected_movies <- collect_movies_up_to_id(10000) 
+
+# Prevent scientific notation when printing large numbers (e.g., budgets, revenues)
+options(scipen = 999)
+
+# Define the file path for the Excel output
+excel_file <- "collected_movies.xlsx"
+
+# Write the collected movie data to an Excel file
+write.xlsx(collected_movies, excel_file, rowNames = FALSE)
+```
+
+# Execution Time and Data Volume
+
+The execution of this code requires a considerable amount of time. In our case, the process was initiated on July 4, 2024, and took approximately 11 days to complete. During this period, the code successfully collected data on around 1 million films. Naturally, as time progresses, the number of films available on the platform will continue to grow, which will consequently increase the execution time required for future data collection.

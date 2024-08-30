@@ -1,0 +1,3551 @@
+---
+title: "Box Office Prediction Model"
+author: "Giorgio Rivoli"
+date: "2024-08-30"
+output: html_document
+---
+
+# Data Collection Process
+
+The starting point of our analysis is the collection of film-related data using the [TMDB (The Movie Database)](https://www.themoviedb.org/) API. TMDB provides comprehensive [documentation](https://developer.themoviedb.org/docs/getting-started) that explains how to use the API to access detailed information about films. Although the most straightforward method to obtain this data would be to request all the available pages, this approach has a [significant limitation](https://www.themoviedb.org/talk/621b62abd18572001df182ea): the API allows access only to the first 500 pages, each containing 20 films, for a total of 10,000 films.
+
+However, our primary objective is to collect data for all the films available in the TMDB database without being restricted by this predefined limit. To overcome this constraint, we adopted a different approach, leveraging the unique numeric ID assigned to each film. In TMDB, each film is identified by an integer starting from 1, which increases progressively for every new film added. Our method, therefore, involves iteratively searching for films starting from ID 1, then ID 2, ID 3, and so on.
+
+The search process continues until a specified number of consecutive unsuccessful attempts is reached, which we set to 10,000. This stopping criterion was introduced to ensure operational efficiency, as a large number of consecutive IDs not associated with any films indicates that we have effectively reached the end of the database. This approach allowed us to achieve a broader and more comprehensive coverage of the films available on TMDB.
+
+Below is the code used to implement this data collection:
+
+```{r}
+# Loading the necessary libraries
+library(httr)        # Library for making HTTP requests
+library(jsonlite)    # Library for handling and converting JSON data
+library(dplyr)       # Library for data manipulation and analysis
+library(openxlsx)    # Library for creating and handling Excel files
+
+# TMDB API Key
+api_key <- "0114e85d1048efca056a34d5022b2bdf" # Personal API key for authenticating requests
+movie_details_url <- "https://api.themoviedb.org/3/movie/" # Base URL for retrieving movie details from the TMDB API
+
+# Function to check and fetch movie details by ID
+fetch_movie_by_id <- function(movie_id) {
+  # The tryCatch block handles potential errors during the API request and data processing
+  tryCatch({
+    # Make a GET request to fetch movie details from the TMDB API
+    response <- GET(paste0(movie_details_url, movie_id), query = list(api_key = api_key, append_to_response = "keywords,credits,releases"))
+    
+    # Check if the API response is successful (status code 200)
+    if (status_code(response) == 200) {
+      # Parse the JSON response into a text format and then convert it to an R list
+      movie <- content(response, "text", encoding = "UTF-8")
+      movie <- fromJSON(movie, flatten = TRUE)
+      
+      # Extract keywords
+      keywords <- if (!is.null(movie$keywords$keywords)) paste(movie$keywords$keywords$name, collapse = ", ") else NA
+      
+      # Extract collection information (if the movie belongs to a collection)
+      belongs_to_collection <- if (!is.null(movie$belongs_to_collection)) movie$belongs_to_collection$name else NA
+      
+      # Extract genres
+      genres <- if (!is.null(movie$genres)) paste(movie$genres$name, collapse = ", ") else NA
+      
+      # Extract production companies
+      production_companies <- if (!is.null(movie$production_companies)) paste(movie$production_companies$name, collapse = ", ") else NA
+      
+      # Extract production countries
+      production_countries <- if (!is.null(movie$production_countries)) paste(movie$production_countries$name, collapse = ", ") else NA
+      
+      # Extract spoken languages
+      spoken_languages <- if (!is.null(movie$spoken_languages)) paste(movie$spoken_languages$name, collapse = ", ") else NA
+      
+      # Extract cast information
+      cast <- if (!is.null(movie$credits$cast)) paste(movie$credits$cast$name, collapse = ", ") else NA
+      
+      # Extract cast genders
+      cast_genders <- if (!is.null(movie$credits$cast)) paste(movie$credits$cast$gender, collapse = ", ") else NA
+      
+      # Extract crew information
+      crew <- if (!is.null(movie$credits$crew)) paste(movie$credits$crew$name, collapse = ", ") else NA
+      
+      # Extract crew genders
+      crew_genders <- if (!is.null(movie$credits$crew)) paste(movie$credits$crew$gender, collapse = ", ") else NA
+      
+      # Extract crew jobs roles
+      jobs <- if (!is.null(movie$credits$crew)) paste(movie$credits$crew$job, collapse = ", ") else NA
+      
+      # Extract certification for US market
+      certification <- NA
+      if (!is.null(movie$releases) && !is.null(movie$releases$countries)) {
+        countries_df <- as.data.frame(movie$releases$countries)
+        if ("iso_3166_1" %in% colnames(countries_df)) {
+          us_release <- countries_df %>% filter(iso_3166_1 == "US")
+          if (nrow(us_release) > 0) {
+            certification <- us_release$certification[1]
+          }
+        }
+      }
+      
+      # Return the extracted movie details as a data frame
+      return(data.frame(
+        id = movie$id, 
+        original_title = movie$original_title, 
+        title = movie$title, 
+        budget = movie$budget, 
+        revenue = movie$revenue,
+        release_date = movie$release_date,
+        vote_count = movie$vote_count,
+        vote_average = movie$vote_average,
+        popularity = movie$popularity,
+        overview = movie$overview,
+        original_language = movie$original_language,
+        runtime = movie$runtime,
+        tagline = movie$tagline,
+        keywords = keywords,
+        belongs_to_collection = belongs_to_collection,
+        genres = genres,
+        production_companies = production_companies,
+        production_countries = production_countries,
+        spoken_languages = spoken_languages,
+        cast = cast,
+        crew = crew,
+        jobs = jobs,
+        cast_genders = cast_genders,
+        crew_genders = crew_genders,
+        certification = certification,
+        stringsAsFactors = FALSE
+      ))
+    } else {
+      # Return NULL if the status code is not 200
+      return(NULL)
+    }
+  }, error = function(e) {
+    # The error block catches any issues (e.g., network errors, JSON parsing errors)
+    # and returns NULL instead of stopping the execution
+    return(NULL)
+  })
+}
+
+# Function to find and collect movies by ID up to a certain limit
+collect_movies_up_to_id <- function(max_attempts) {
+  # Create an empty data frame to store all movie details
+  all_movies <- data.frame(
+    id = integer(), original_title = character(), title = character(), budget = numeric(), revenue = numeric(), 
+    release_date = character(), vote_count = integer(), vote_average = numeric(), popularity = numeric(), 
+    overview = character(), original_language = character(), runtime = integer(), tagline = character(), 
+    keywords = character(), belongs_to_collection = character(), genres = character(), 
+    production_companies = character(), production_countries = character(), spoken_languages = character(), 
+    cast = character(), crew = character(), jobs = character(), cast_genders = character(), 
+    crew_genders = character(), certification = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  missing_count <- 0 # Counter for consecutive missing movie IDs
+  movie_id <- 1 # Start searching from movie ID 1
+  
+  # Loop until the number of missing movie IDs reaches the maximum limit
+  while (missing_count < max_attempts) {
+    movie <- fetch_movie_by_id(movie_id) # Attempt to fetch movie details by ID
+    if (!is.null(movie)) {
+      # If movie is found, add it to the collected movies data frame
+      all_movies <- bind_rows(all_movies, movie)
+      print(paste("Movie found with ID:", movie_id))
+      missing_count <- 0 # Reset the missing count when a movie is found
+    } else {
+      # If no movie is found, increment the missing count
+      missing_count <- missing_count + 1
+      print(paste("Movies not found:", missing_count)) # Print the missing count
+    }
+    movie_id <- movie_id + 1 # Move to the next movie ID
+    Sys.sleep(0.1) # Add a small delay to avoid hitting API rate limits
+  }
+  
+  # Return the complete collection of movies found
+  return(all_movies)
+}
+
+# Collect movies, stopping after encountering 10,000 consecutive missing IDs
+collected_movies <- collect_movies_up_to_id(10000) 
+
+# Prevent scientific notation when printing large numbers (e.g., budgets, revenues)
+options(scipen = 999)
+
+# Define the file path for the Excel output
+excel_file <- "collected_movies.xlsx"
+
+# Write the collected movie data to an Excel file
+write.xlsx(collected_movies, excel_file, rowNames = FALSE)
+```
+
+# Execution Time and Data Volume
+
+The execution of this code requires a considerable amount of time. In our case, the process was initiated on July 4, 2024, and took approximately 11 days to complete. During this period, the code successfully collected data on around 1 million films. Naturally, as time progresses, the number of films available on the platform will continue to grow, which will consequently increase the execution time required for future data collection.
+
+# Data Preparation
+
+We now move on to the preparation of our dataset. We begin with the
+`collected_movies` dataset obtained through the TMDB API. The goal is to
+transform this dataset into a more refined version that will enable us
+to perform the necessary analyses.
+
+```{r}
+# Load required libraries
+library(readxl)       # For reading Excel files
+library(openxlsx)     # For writing Excel files
+library(dplyr)        # For data manipulation
+library(httr)         # For HTTP requests
+library(jsonlite)     # For working with JSON data
+library(tidyr)        # For data tidying
+library(stringr)      # For string manipulation
+library(tidyverse)    # Meta-package for data science
+library(tidytext)     # For text analysis
+library(textdata)     # For accessing textual datasets
+library(lubridate)    # For date-time manipulation
+library(scrapex)      # For web scraping
+library(rvest)        # For web scraping and parsing HTML
+library(ggplot2)      # For data visualization
+library(cowplot)      # For combining plots
+library(explore)      # For interactive data exploration
+library(patchwork)    # For combining multiple plots
+library(mice)         # For imputing missing values
+library(Amelia)       # For multiple imputation
+library(missForest)   # For imputing missing values using random forests
+```
+
+To begin, let’s import the dataset that includes all the movies.
+
+```{r}
+# Read the Excel file containing collected movie data
+collected_movies <- read_excel("collected_movies.xlsx")
+```
+
+This operation takes approximately 9 minutes.
+
+# Filtering Data
+
+Once completed, we will remove all movies with a `revenue` value of 0.
+This variable is crucial for our future predictive analysis, so movies
+with a revenue of 0 are not relevant to us.
+
+```{r}
+# Filter out movies with zero revenue
+movie_data <- collected_movies[collected_movies$revenue > 0, ]
+```
+
+The new dataset consists of significantly fewer observations, precisely
+**21,820**, which represent about 2% of the total number of films in the
+complete dataset. We can further reduce our dataset. For example, there
+are films with a release **year** of **2025**, but we are only
+interested in those that have already recorded revenue. Therefore, we
+exclude these films. To do this, we first need to manipulate the date,
+creating two new columns: **year** and **month**.
+
+```{r}
+# Remove rows with NA in the release_date column
+movie_data <- movie_data |> 
+  filter(!is.na(release_date))
+
+# Create year and month columns from release_date
+movie_data <- movie_data |> 
+  mutate(year = substr(release_date, 1, 4)) |> 
+  relocate(year, .after = release_date) |> 
+  mutate(month = substr(release_date, 6, 7)) |> 
+  relocate(month, .after = year)
+```
+
+Once this is done, we can proceed with the operation.
+
+An additional filter concerns the duration (**runtime**). Audiovisual
+content can be divided into three categories: *short films,
+medium-length films,* and *feature films*. There is no unanimous
+definition, but generally, a short film has a maximum duration of 20/30
+minutes, a medium-length film lasts between 20/30 and 60 minutes. Since
+we want to focus on feature films that are released in theaters, we will
+exclude from the dataset all films with a duration of less than **60
+minutes**. We also noticed two films with a duration of over **400
+minutes**. Upon further investigation, we discovered that they are not
+unique films, but episodes of a television series considered as a single
+film. These are also not of our interest and we will exclude them.
+
+Finally, we focus on the **budget** variable. Examining the dataset, we
+noticed some films with extremely low budgets, even as low as ten
+dollars. It is unlikely that a film can be produced, edited, and
+distributed with such a low budget. We chose a threshold of 6,000
+dollars, based on several attempts. Up to this threshold, the budgets
+seemed improbable to us. With a threshold of 7,000 dollars, we found the
+film *El Mariachi* by *Robert Rodriguez*, produced with a budget of
+7,000 dollars. Therefore, we set the threshold at **6,000** dollars.
+
+```{r}
+# Filter out other movies
+movie_data <- movie_data |> 
+  filter(!year == 2025) |> 
+  filter(!runtime < 60) |> 
+  filter(!runtime > 400) |> 
+  filter(!budget < 6000)
+```
+
+Next, we will remove all rows where **NA values** could cause issues.
+However, for some variables, we will not eliminate observations with NA
+values, as they will either be manipulated differently later or we will
+opt for imputation.
+
+```{r}
+# Remove rows with NA values in important columns
+movie_data <- movie_data |> 
+  filter(!is.na(overview)) |> 
+  filter(!is.na(original_language)) |> 
+  filter(!is.na(genres)) |> 
+  filter(!is.na(production_countries)) |> 
+  filter(!is.na(spoken_languages)) |> 
+  filter(!is.na(cast)) |> 
+  filter(!is.na(crew)) |> 
+  filter(!is.na(jobs)) |> 
+  filter(!is.na(cast_genders)) |> 
+  filter(!is.na(crew_genders))
+```
+
+Finally, we also remove rows that have potential duplicates for the
+`title` variable.
+
+```{r}
+# Remove duplicates based on the "title" column 
+movie_data <- movie_data |> 
+  distinct(title, .keep_all = TRUE)
+```
+
+As a result of these operations, our dataset includes just over 10,000
+films.
+
+# Data Manipulation
+
+We can now proceed with the manipulation of existing variables and, in
+many cases, create new variables starting from the initial ones. To make
+understanding easier, we will work from the first columns on the left
+towards the right.
+
+### Title
+
+With reference to the titles in our dataset, we have two variables:
+`original_title` and `title`. The first operation we will perform on
+these variables is the creation of two new columns, which will contain
+the **word count** of the original title and the translated title,
+respectively.
+
+```{r}
+# Add columns for word count in title and original title
+movie_data <- movie_data |> 
+  mutate(nmb_wrd_title = sapply(strsplit(as.character(title), " "), length)) |> 
+  mutate(nmb_wrd_orgnl = sapply(strsplit(as.character(original_title), " "), length)) |> 
+  select(id, original_title, nmb_wrd_orgnl, title, nmb_wrd_title, everything())
+```
+
+Subsequently, we will proceed with **sentiment analysis** on the title
+variable. For this operation, we will use the **AFINN lexicon**, a
+regression approach that assigns scores to words ranging from -3 to 3.
+The result of this manipulation will be a new column that, starting from
+the title in English (i.e., the `title` column), will return a numerical
+value derived from the sum of the sentiments of all the words that make
+up the title. Naturally, the lower the score, the more the title will be
+associated with negative sentiments, and vice versa.
+
+```{r}
+# Load the Afinn sentiment lexicon
+afinn <- get_sentiments("afinn")
+
+# Calculate sentiment score for each title
+titles_sentiment <- movie_data |> 
+  unnest_tokens(word, title) |> 
+  inner_join(afinn, by = "word") |> 
+  group_by(id) |> 
+  summarize(afinn_title = sum(value, na.rm = TRUE))
+
+# Merge sentiment score with the original dataset
+movie_data <- movie_data |> 
+  left_join(titles_sentiment, by = "id") |> 
+  relocate(afinn_title, .after = nmb_wrd_title) |>
+  mutate(afinn_title = replace_na(afinn_title, 0))
+
+# Remove temporary datasets
+rm(afinn)
+rm(titles_sentiment)
+```
+
+### Budget & Revenue
+
+Regarding the budget and revenue variables, we will not perform many
+manipulations. Specifically, for the revenue variable, we have only
+excluded values equal to zero, while for the budget variable, we have
+removed all films with a budget of less than \$6000 from the dataset.
+Consequently, we will create a new variable that represents the **ratio
+between the film’s revenue and its budget**.
+
+```{r}
+# Calculate revenue to budget ratio
+movie_data <- movie_data |> 
+  mutate(rev_bud_ratio = revenue / budget) |> 
+  relocate(rev_bud_ratio, .after = revenue)
+
+# Round the revenue to budget ratio to 2 decimal places
+movie_data$rev_bud_ratio <- round(movie_data$rev_bud_ratio, 2)
+```
+
+### Date
+
+Regarding the date variable, it was manipulated at the beginning of the
+process, creating two new columns: one for the year and one for the
+month.
+
+### Votes & Popularity
+
+For now, we will not modify these variables, as we will use them in the
+future to work with those related to the cast and crew.
+
+### Intellectual Property (IP)
+
+Now we will proceed to create a variable related to intellectual
+properties. This variable will take the value **1** if the film is
+based, for example, on a **book or a video game**, while it will take
+the value **0** if it is a **completely original idea**. To do this, we
+have identified all possible roles in the `jobs` column that indicate
+the presence of a source on which the film is based.
+
+```{r}
+# list of IP (Intellectual Property) roles
+ip_roles <- c("Author", "Book", "Comic Book", "Graphic Novel", "Graphic Novel Illustrator", "Idea", "Novel", "Original Concept", "Original Film Writer", "Original Series Creator", "Original Series Design", "Original Story", "Poem", "Radio Play", "Scenario Writer", "Short Story", "Theatre Play", "Video Game")
+
+# Create new IP column based on job roles
+movie_data <- movie_data |> 
+  mutate(IP = sapply(strsplit(jobs, ", "), function(x) {
+    if(any(x %in% ip_roles)) 1 else 0
+  })) |> 
+  relocate(IP, .after = month)
+
+# Remove ip_roles list
+rm(ip_roles)
+```
+
+### Overview
+
+Regarding the `overview` variable, which contains the summaries of each
+film’s plot, we will perform a **sentiment analysis**. For this
+analysis, we will use the same approach employed for the sentiment
+analysis of the titles, namely the AFINN lexicon. The result of this
+analysis will be a new variable that contains the sentiment score for
+each film’s plot.
+
+```{r}
+# Load the Afinn sentiment lexicon
+afinn <- get_sentiments("afinn")
+  
+# Calculate sentiment score for each movie overview
+overview_sentiment <- movie_data |> 
+  unnest_tokens(word, overview) |> 
+  inner_join(afinn, by = "word") |> 
+  group_by(id) |> 
+  summarize(overview_sentiment = sum(value, na.rm = TRUE))
+
+# Merge overview sentiment score with the original dataset
+movie_data <- movie_data |> 
+  left_join(overview_sentiment, by = "id") |> 
+  mutate(overview_sentiment = replace_na(overview_sentiment, 0)) |> 
+  relocate(overview_sentiment, .after = overview)
+
+# Remove temporary datasets
+rm(overview_sentiment)
+rm(afinn)
+```
+
+### Original Language
+
+Now we will proceed with the manipulation of the `original_language`
+variable. This column contains many unique values (e.g., “en”, “de”,
+“es”, etc.). To make our analysis more manageable, we will give
+particular emphasis to films that have English as their original
+language. Therefore, we will ensure that this column takes the value
+**1** if the original language of the film is **English** (“en”) and the
+value **0** if the original language is **different from English**.
+
+```{r}
+# Convert original_language to binary (1 for English, 0 for others)
+movie_data <- movie_data |> 
+  mutate(original_language = ifelse(original_language == "en", 1, 0))
+```
+
+### Tagline
+
+For the `tagline` variable, we will start by creating a new column that
+contains the **number of words** present in the tagline.
+
+```{r}
+# Add column for tagline word count
+movie_data <- movie_data |> 
+  mutate(nmb_wrd_tagline = ifelse(is.na(tagline), 0, sapply(strsplit(as.character(tagline), " "), length))) |> 
+  relocate(nmb_wrd_tagline, .after = tagline)
+```
+
+Next, we will perform a **sentiment analysis** of the `tagline`
+variable, using the same approach employed for previous sentiment
+analyses. In this case as well, the result will be a new variable that
+contains the score associated with each tagline.
+
+```{r}
+# Caricare il lexicon Afinn
+afinn <- get_sentiments("afinn")
+# Calcolare il punteggio di sentimento per ciascuna tagline
+tagline_sentiment <- movie_data |> 
+  unnest_tokens(word, tagline) |> 
+  inner_join(afinn, by = "word") |> 
+  group_by(id) |> 
+  summarize(tagline_afinn = sum(value, na.rm = TRUE))
+# Unire il punteggio di sentimento al dataset originale
+movie_data <- movie_data |> 
+  left_join(tagline_sentiment, by = "id") |> 
+  relocate(tagline_afinn, .after = nmb_wrd_tagline) |> 
+  mutate(tagline_afinn = replace_na(tagline_afinn,0))
+# Rimuovere i dataset creati
+rm(afinn)
+rm(tagline_sentiment)
+```
+
+### Keywords
+
+We will not perform any manipulations or analyses on the `keywords`
+variable, as it will be **subsequently removed** from the dataset. This
+variable is not considered very important, as the information contained
+in the title, overview, and tagline is already sufficiently
+representative and includes the data found in the keywords variable.
+
+### Collection
+
+For collections, we will assign a value of **1** to films that are
+**part of a collection** and a value of **0** to **those that are not**.
+In the future, this variable could be treated more thoroughly by
+assigning a weight to the saga (for example, calculating the average
+revenue of the saga) and determining the number of films in the saga to
+which the film in question belongs.
+
+```{r}
+# Convert 'belongs_to_collection' to binary (1 if present, 0 if not)
+movie_data <- movie_data |> 
+  mutate(belongs_to_collection = 
+           ifelse(belongs_to_collection == is.na(belongs_to_collection), 0, 1)) |> 
+  mutate(belongs_to_collection = replace_na(belongs_to_collection, 0))
+```
+
+### Genres
+
+Now we will proceed to create **dummy variables** for the genres. The
+first step is to create a list of all the unique genres present in the
+dataset.
+
+```{r}
+# Extract unique genres from the 'genres' column
+all_genres <- unique(unlist(str_split(movie_data$genres, ", ")))
+```
+
+Once this step is completed, we will create a **separate column** for
+each genre.
+
+```{r}
+# Create binary columns for each genre
+for(genre in all_genres) {
+  movie_data[[genre]] <- as.integer(str_detect(movie_data$genres, fixed(genre)))
+}
+
+# Clean up temporary variables
+rm(all_genres)
+rm(genre)
+```
+
+### Production Companies
+
+The variable related to production companies will subsequently be
+removed from the dataset. Although it is possible to conduct an analysis
+similar to that planned for the actors, this would significantly
+increase the complexity of the analysis without providing a proportional
+benefit. Therefore, we consider it appropriate to **eliminate** this
+variable at a later stage.
+
+### Production Countries
+
+In this case as well, we perform an operation similar to the one done
+for the original language. If the film has ***United States of
+America*** as its country of production, the value will be **1**;
+otherwise, the value will be **0**.
+
+```{r}
+# Convert 'production_countries' to binary (1 if USA, 0 if not)
+movie_data$production_countries <- as.integer(str_detect(movie_data$production_countries, fixed("United States of America")))
+```
+
+### Spoken Languages
+
+The first operation we will perform regarding the variable
+`spoken_languages` will be the creation of a new column. This column
+will contain the **number of languages spoken** in the film.
+
+```{r}
+# Count number of spoken languages
+movie_data <- movie_data |> 
+  mutate(nmb_spoken_languages = case_when(
+    spoken_languages == "No Language" ~ 0, 
+    TRUE ~ str_count(spoken_languages, ",") + 1
+  )) |> 
+  relocate(nmb_spoken_languages, .after = original_language)
+
+# The function str_count(spoken_languages, ",") counts the number of commas in the string. However, the number of languages is always one more than the number of commas. Here’s why: If there is only one language, there are no commas. E.g.: ‘English’ (1 language, 0 commas). If there are two languages, there is one comma. E.g.: ‘English, French’ (2 languages, 1 comma). If there are three languages, there are two commas. E.g.: ‘English, French, German’ (3 languages, 2 commas).
+```
+
+Now, we will follow the same logic used for production companies, but
+instead of considering *United States of America*, we will consider
+***English***.
+
+```{r}
+# Convert 'spoken_languages' to binary (1 if English, 0 if not)
+movie_data$spoken_languages <- as.integer(str_detect(movie_data$spoken_languages, fixed("English")))
+
+movie_data <- movie_data |> 
+  relocate(spoken_languages, .after = original_language)
+```
+
+### Cast
+
+The `cast` column contains, in most cases, all the actors who
+participated in a given film. After a check, we noticed that the actors
+are listed in order of screen time. Therefore, the first name in the
+*cast* column of a film indicates the lead actor, followed by the other
+actors in order of importance. The analysis we will perform will consist
+of creating **two new columns**: the first will contain the name of the
+**lead actor**, while the second will contain the name of the **second
+most relevant actor**.
+
+```{r}
+# Extract first two actors (stars) from the 'cast' column
+movie_data <- movie_data |> 
+  mutate(
+    cast_list = strsplit(cast, ", "),
+    Star1 = sapply(cast_list, function(x) if(length(x) >= 1) x[1] else NA_character_),
+    Star2 = sapply(cast_list, function(x) if(length(x) >= 2) x[2] else NA_character_)
+  ) |> 
+  select(-cast_list)
+```
+
+Now we will proceed in the same way, but this time, instead of focusing
+on the names, we will focus on the **gender** of the two main actors.
+
+```{r}
+# Extract genders for the first two stars
+movie_data <- movie_data |> 
+  mutate(
+    gender_list = strsplit(cast_genders, ", "),
+    Star_gender1 = sapply(gender_list, function(x) if(length(x) >= 1) x[1] else NA_character_),
+    Star_gender2 = sapply(gender_list, function(x) if(length(x) >= 2) x[2] else NA_character_)
+  ) |> 
+  select(-gender_list) |> 
+  relocate(Star_gender1, .after = Star1) |> 
+  relocate(Star_gender2, .after = Star2)
+
+movie_data <- movie_data |> 
+  filter(!is.na(Star_gender2))
+```
+
+However, we want the **two main actors** to be represented in the
+dataset in **numerical form** rather than as names. Therefore, we will
+transform the names by replacing them with the **average box office
+earnings** of the films each actor has participated in up to a certain
+date. Additionally, to give weight to the role assumed by the actor, the
+average will be **weighted**: if the actor was not the main protagonist
+but the second most important, we will multiply the box office by 0.75.
+
+```{r}
+  # Convert release_date to a date format
+  movie_data <- movie_data |> 
+    mutate(release_date = ymd(release_date))
+  
+  # Function to calculate the weighted average revenue for an actor
+  calc_weighted_revenue <- function(actor, date, dataset, is_star1) {
+    relevant_movies <- dataset |> 
+      filter((Star1 == actor | Star2 == actor) & release_date < date) |> 
+      mutate(weight = case_when(
+        Star1 == actor & is_star1 ~ 1, # Full weight if the actor is Star1 and we're calculating for Star1
+        Star2 == actor & !is_star1 ~ 1, # Full weight if the actor is Star2 and we're calculating for Star2
+        TRUE ~ 0.75 # Partial weight (0.75) for secondary relevance
+      ))
+    
+    # Return 0 if no relevant movies are found
+    if(nrow(relevant_movies) == 0) return(0)
+    
+    # Calculate the weighted sum and average revenue
+    weighted_sum <- sum(relevant_movies$revenue * relevant_movies$weight)
+    total_weight <- sum(relevant_movies$weight)
+    
+    return(weighted_sum / total_weight)
+  }
+  
+  # Apply the calc_weighted_revenue function to each row for both Star1 and Star2
+  movie_data <- movie_data |> 
+    rowwise() |> 
+    mutate(
+      Star1_rev = calc_weighted_revenue(Star1, release_date, movie_data, TRUE),
+      Star2_rev = calc_weighted_revenue(Star2, release_date, movie_data, FALSE)
+    ) |> 
+    ungroup()
+  
+  # Round the revenue estimates for Star1 and Star2
+  movie_data$Star1_rev <- round(movie_data$Star1_rev, 0)
+  movie_data$Star2_rev <- round(movie_data$Star2_rev, 0)
+  
+  # Adjust the column order and remove unnecessary columns
+  movie_data <- movie_data |>
+    select(-c(Star1, Star2)) |>
+    relocate(Star1_rev, .after = `TV Movie`) |>
+    relocate(Star2_rev, .after = Star_gender1)
+  
+  # Clean up temporary objects
+  rm(calc_weighted_revenue)
+```
+
+Now we do the same, but for `vote_average` variable.
+
+```{r}
+# Extract first two actors (stars) from the 'cast' column
+movie_data <- movie_data |> 
+  mutate(
+    cast_list = strsplit(cast, ", "),
+    Star1 = sapply(cast_list, function(x) if(length(x) >= 1) x[1] else NA_character_),
+    Star2 = sapply(cast_list, function(x) if(length(x) >= 2) x[2] else NA_character_)
+  ) |> 
+  select(-cast_list)
+
+movie_data <- movie_data |> 
+  filter(!is.na(movie_data$vote_average)) |> 
+  filter(!is.na(movie_data$popularity))
+# Convert release_date to a date format
+  movie_data <- movie_data |> 
+    mutate(release_date = ymd(release_date))
+  
+  # Function to calculate the weighted average vote for an actor
+  calc_weighted_vote <- function(actor, date, dataset, is_star1) {
+    relevant_movies <- dataset |> 
+      filter((Star1 == actor | Star2 == actor) & release_date < date) |> 
+      mutate(weight = case_when(
+        Star1 == actor & is_star1 ~ 1, # Full weight if the actor is Star1 and we're calculating for Star1
+        Star2 == actor & !is_star1 ~ 1, # Full weight if the actor is Star2 and we're calculating for Star2
+        TRUE ~ 0.75 # Partial weight (0.75) for secondary relevance
+      ))
+    
+    # Return 0 if no relevant movies are found
+    if(nrow(relevant_movies) == 0) return(0)
+    
+    # Calculate the weighted sum and average vote
+    weighted_sum <- sum(relevant_movies$vote_average * relevant_movies$weight)
+    total_weight <- sum(relevant_movies$weight)
+    
+    return(weighted_sum / total_weight)
+  }
+  
+  # Apply the calc_weighted_vote function to each row for both Star1 and Star2
+  movie_data <- movie_data |> 
+    rowwise() |> 
+    mutate(
+      Star1_vote = calc_weighted_vote(Star1, release_date, movie_data, TRUE),
+      Star2_vote = calc_weighted_vote(Star2, release_date, movie_data, FALSE)
+    ) |> 
+    ungroup()
+  
+  # Round the vote estimates for Star1 and Star2
+  movie_data$Star1_vote <- round(movie_data$Star1_vote, 2)
+  movie_data$Star2_vote <- round(movie_data$Star2_vote, 2)
+  
+  # Adjust the column order and remove unnecessary columns
+  movie_data <- movie_data |>
+    select(-c(Star1, Star2)) |>
+    relocate(Star1_vote, .after = `Star1_rev`) |>
+    relocate(Star2_vote, .after = Star2_rev)
+  
+  # Clean up temporary objects
+  rm(calc_weighted_vote)
+```
+
+And the same for the `popularity` variable
+
+```{r}
+# Extract first two actors (stars) from the 'cast' column
+movie_data <- movie_data |> 
+  mutate(
+    cast_list = strsplit(cast, ", "),
+    Star1 = sapply(cast_list, function(x) if(length(x) >= 1) x[1] else NA_character_),
+    Star2 = sapply(cast_list, function(x) if(length(x) >= 2) x[2] else NA_character_)
+  ) |> 
+  select(-cast_list)
+
+# Convert release_date to a date format
+  movie_data <- movie_data |> 
+    mutate(release_date = ymd(release_date))
+  
+  # Function to calculate the weighted average popularity for an actor
+  calc_weighted_pop <- function(actor, date, dataset, is_star1) {
+    relevant_movies <- dataset |> 
+      filter((Star1 == actor | Star2 == actor) & release_date < date) |> 
+      mutate(weight = case_when(
+        Star1 == actor & is_star1 ~ 1, # Full weight if the actor is Star1 and we're calculating for Star1
+        Star2 == actor & !is_star1 ~ 1, # Full weight if the actor is Star2 and we're calculating for Star2
+        TRUE ~ 0.75 # Partial weight (0.75) for secondary relevance
+      ))
+    
+    # Return 0 if no relevant movies are found
+    if(nrow(relevant_movies) == 0) return(0)
+    
+    # Calculate the weighted sum and average popularity
+    weighted_sum <- sum(relevant_movies$popularity * relevant_movies$weight)
+    total_weight <- sum(relevant_movies$weight)
+    
+    return(weighted_sum / total_weight)
+  }
+  
+  # Apply the calc_weighted_popularity function to each row for both Star1 and Star2
+  movie_data <- movie_data |> 
+    rowwise() |> 
+    mutate(
+      Star1_pop = calc_weighted_pop(Star1, release_date, movie_data, TRUE),
+      Star2_pop = calc_weighted_pop(Star2, release_date, movie_data, FALSE)
+    ) |> 
+    ungroup()
+  
+  # Round the popularuty estimates for Star1 and Star2
+  movie_data$Star1_pop <- round(movie_data$Star1_pop, 3)
+  movie_data$Star2_pop <- round(movie_data$Star2_pop, 3)
+  
+  # Adjust the column order and remove unnecessary columns
+  movie_data <- movie_data |>
+    select(-c(Star1, Star2)) |>
+    relocate(Star1_pop, .after = `Star1_vote`) |>
+    relocate(Star2_pop, .after = Star2_vote)
+  
+  # Clean up temporary objects
+  rm(calc_weighted_pop)
+```
+
+### Crew
+
+Similarly to what was done for the cast, numerous crew members with
+their respective roles are listed in the `jobs` column for each film. We
+have therefore decided to select the roles that can be considered most
+relevant to the production of a film and that are also more widely known
+to the general public, thus influencing the attendance in cinemas.
+Specifically, we have decided to create new columns for the following
+roles: *Director* and *Screenwriter* (*Screenplay variable*).
+
+```{r}
+# Define roles to extract 
+roles <- c("Director", "Screenplay")
+
+# Function to extract names and genders for a specific role
+extract_role <- function(crew, jobs, genders, role) {
+  crew_list <- strsplit(crew, ", ")
+  jobs_list <- strsplit(jobs, ", ")
+  genders_list <- strsplit(genders, ", ")
+  
+   # Extract names and genders based on matching roles
+  names <- sapply(seq_along(crew_list), function(i) {
+    paste(crew_list[[i]][jobs_list[[i]] == role], collapse = ", ")
+  })
+  
+  genders <- sapply(seq_along(crew_list), function(i) {
+    paste(genders_list[[i]][jobs_list[[i]] == role], collapse = ", ")
+  })
+  
+  list(names = names, genders = genders)
+}
+
+# Apply the extract_role function to each specified role
+new_columns <- lapply(roles, function(role) {
+  result <- extract_role(movie_data$crew, movie_data$jobs, movie_data$crew_genders, role)
+  new_df <- data.frame(
+    names = result$names,
+    genders = result$genders
+  )
+  names(new_df) <- c(role, paste0(role, "_gender"))
+  new_df
+})
+
+# Combine the results into a single data frame
+new_data <- do.call(cbind, new_columns)
+
+# Add the new columns to the original dataset
+movie_data <- cbind(movie_data, new_data)
+
+# Clean up temporary objects
+rm(new_data)
+rm(new_columns)
+rm(extract_role)
+```
+
+In this case as well, we will transform the names of the crew members
+into **numerical values**, using the same approach adopted for the
+actors.
+
+```{r}
+# Function to calculate the average revenue for a person in a specific role
+calc_avg_revenue <- function(person, date, dataset, role) {
+  relevant_movies <- dataset %>%
+    filter(str_detect(!!sym(role), person) & release_date < date)
+  
+  # Return 0 if no relevant movies are found
+  if(nrow(relevant_movies) == 0) return(0)
+  
+  return(mean(relevant_movies$revenue))
+}
+
+# Function to apply calc_avg_revenue for all names in a string
+calc_role_revenue <- function(names, date, dataset, role) {
+  if (is.na(names) || names == "") return(0)
+  
+  people <- str_split(names, ",\\s*")[[1]]
+  revenues <- sapply(people, function(p) calc_avg_revenue(p, date, dataset, role))
+  return(mean(revenues))
+}
+
+# List of roles to apply the revenue calculation
+roles <- c("Director", "Screenplay")
+
+# Apply the revenue calculation function to each role for each row
+movie_data <- movie_data %>%
+  rowwise() %>%
+  mutate(across(
+    all_of(roles),
+    ~ calc_role_revenue(., release_date, movie_data, cur_column()),
+    .names = "{.col}_rev"
+  )) %>%
+  ungroup()
+
+# Round the calculated revenue columns
+movie_data$Director_rev <- round(movie_data$Director_rev, 0)
+movie_data$Screenplay_rev <- round(movie_data$Screenplay_rev, 0)
+
+# Adjust column order and remove original role columns
+movie_data <- movie_data |> 
+  relocate(Director_rev, .after = Director) |> 
+  relocate(Screenplay_rev, .after = Screenplay)
+
+# DIRECTOR POPULARITY
+
+# Function to calculate the average revenue for a person in a specific role
+calc_avg_pop <- function(person, date, dataset, role) {
+  relevant_movies <- dataset %>%
+    filter(str_detect(!!sym(role), person) & release_date < date)
+  
+  # Return 0 if no relevant movies are found
+  if(nrow(relevant_movies) == 0) return(0)
+  
+  return(mean(relevant_movies$popularity))
+}
+
+# Function to apply calc_avg_revenue for all names in a string
+calc_role_pop <- function(names, date, dataset, role) {
+  if (is.na(names) || names == "") return(0)
+  
+  people <- str_split(names, ",\\s*")[[1]]
+  popularities <- sapply(people, function(p) calc_avg_pop(p, date, dataset, role))
+  return(mean(popularities))
+}
+
+# List of roles to apply the revenue calculation
+roles <- c("Director", "Screenplay")
+
+# Apply the revenue calculation function to each role for each row
+movie_data <- movie_data %>%
+  rowwise() %>%
+  mutate(across(
+    all_of(roles),
+    ~ calc_role_pop(., release_date, movie_data, cur_column()),
+    .names = "{.col}_pop"
+  )) %>%
+  ungroup()
+
+# Round the calculated revenue columns
+movie_data$Director_pop <- round(movie_data$Director_pop, 3)
+movie_data$Screenplay_pop <- round(movie_data$Screenplay_pop, 3)
+
+# Adjust column order and remove original role columns
+movie_data <- movie_data |> 
+  relocate(Director_pop, .after = Director_rev) |> 
+  relocate(Screenplay_pop, .after = Screenplay_rev)
+
+# DIRECTOR VOTE
+
+# Function to calculate the average revenue for a person in a specific role
+calc_avg_vote <- function(person, date, dataset, role) {
+  relevant_movies <- dataset %>%
+    filter(str_detect(!!sym(role), person) & release_date < date)
+  
+  # Return 0 if no relevant movies are found
+  if(nrow(relevant_movies) == 0) return(0)
+  
+  return(mean(relevant_movies$vote_average))
+}
+
+# Function to apply calc_avg_revenue for all names in a string
+calc_role_vote <- function(names, date, dataset, role) {
+  if (is.na(names) || names == "") return(0)
+  
+  people <- str_split(names, ",\\s*")[[1]]
+  votes <- sapply(people, function(p) calc_avg_vote(p, date, dataset, role))
+  return(mean(votes))
+}
+
+# List of roles to apply the revenue calculation
+roles <- c("Director", "Screenplay")
+
+# Apply the revenue calculation function to each role for each row
+movie_data <- movie_data %>%
+  rowwise() %>%
+  mutate(across(
+    all_of(roles),
+    ~ calc_role_vote(., release_date, movie_data, cur_column()),
+    .names = "{.col}_vote"
+  )) %>%
+  ungroup()
+
+# Round the calculated revenue columns
+movie_data$Director_vote <- round(movie_data$Director_vote, 2)
+movie_data$Screenplay_vote <- round(movie_data$Screenplay_vote, 2)
+
+# Adjust column order and remove original role columns
+movie_data <- movie_data |> 
+  relocate(Director_vote, .after = Director_pop) |> 
+  relocate(Screenplay_vote, .after = Screenplay_pop) |> 
+  select(-c(Director, Screenplay))
+
+# Clean up temporary objects
+rm(calc_avg_revenue)
+rm(calc_role_revenue)
+rm(calc_avg_pop)
+rm(calc_avg_vote)
+rm(calc_role_pop)
+rm(calc_role_vote)
+rm(roles)
+```
+
+Now we remove also the observations where the director gender is
+unknown. Furthermore, we remove the observations where we have more than
+one director.
+
+```{r}
+movie_data <- movie_data |> 
+  filter(!Director_gender == 0) |>
+  filter(!Star_gender1 == 0) |> 
+  filter(!str_detect(Director_gender, ","))
+```
+
+And we want the genders with 0 and 1.
+
+```{r}
+movie_data <- movie_data %>%
+  mutate(
+    Star_gender1 = as.numeric(as.character(Star_gender1)) - 1,
+    Star_gender2 = as.numeric(as.character(Star_gender2)) - 1,
+    Director_gender = as.numeric(as.character(Director_gender)) - 1
+  )
+```
+
+### Original Music
+
+In a film, music plays a fundamental role. In this regard, *George
+Lucas*, director and producer of the *Star Wars saga*, once said: ‘*The
+sound and music are 50% of the entertainment in a movie*’. Indeed, in
+the history of cinema, there are films that we can easily identify
+thanks to their soundtrack, and others that have made clever use of
+non-original songs, increasing the film’s appeal. Therefore, we have
+opted to create a new variable that identifies whether a film features
+original music or not. To do this, we examined which films in the ‘jobs’
+column had the role of ‘Original Music Composer’.
+
+```{r}
+# Create a new column indicating if "Original Music Composer" is present in jobs
+movie_data <- movie_data |> 
+  mutate(original_music = ifelse(grepl("Original Music Composer", jobs), 1, 0))
+```
+
+### CPI Index
+
+Now let’s add a column related to the CPI index. The **CPI (Consumer
+Price Index)** is a measure that reflects the average change over time
+in the prices paid by consumers for a basket of consumer goods and
+services. In practice, the CPI monitors ***inflation***, indicating how
+much the cost of living increases or decreases. This data could be
+useful in our analysis, as we consider cinema to be a non-essential
+service and, therefore, the trend of people going to the cinema could be
+influenced by the economic situation. The CPI data will be collected
+through a web scraping activity on the [Federal Reserve Bank of
+Minneapolis
+website](https://www.minneapolisfed.org/about-us/monetary-policy/inflation-calculator/consumer-price-index-1913-)
+
+```{r}
+# Web scraping: Extract inflation data (CPI) from a website
+link <- "https://www.minneapolisfed.org/about-us/monetary-policy/inflation-calculator/consumer-price-index-1913-"
+
+html_website <- link |> 
+  read_html()
+
+# Extract all tables from the webpage
+all_tables <- html_website |> 
+  html_table()
+
+# Select the first table (CPI data)
+CPI_data <- all_tables[1]
+
+# Convert the CPI data into a data frame
+CPI <- as.data.frame(CPI_data[[1]])
+
+# Clean up temporary objects
+rm(link)
+rm(html_website)
+rm(all_tables)
+rm(CPI_data)
+
+# Rename columns and remove unnecessary columns from the CPI data
+CPI <- CPI |> 
+  rename(year = Year) |> 
+  rename(average_cpi = `Annual Average CPI(-U)`) |> 
+  select(-`Annual Percent Change
+            (rate of inflation)`)
+
+# Join the movie dataset with CPI data based on the year
+movie_data <- movie_data |> 
+  mutate(year = as.integer(year)) |> 
+  left_join(CPI, by = c("year"))
+
+# Clean up the CPI object
+rm(CPI)
+```
+
+### Certification
+
+Now let’s focus on the variable `certification`. This variable refers to
+movie **ratings**, which indicate the appropriate audience for a film,
+taking into account elements such as language, violence, and adult
+content. The ratings present in the dataset are:
+
+-   **G (General Audiences)**: Suitable for all ages, with no
+    inappropriate content.
+
+-   **PG (Parental Guidance Suggested)**: Some content may not be
+    suitable for children; parental supervision is advised.
+
+-   **PG-13 (Parents Strongly Cautioned)**: Some content may be
+    inappropriate for children under 13; strong parental supervision is
+    recommended.
+
+-   **R (Restricted)**: Children under 17 can only watch the film
+    accompanied by an adult due to strong content or mature themes.
+
+-   **NC-17 (Adults Only)**: Not suitable for children under 17; the
+    film contains extremely explicit content.
+
+-   **NR (Not Rated)**: The film has not been officially rated by a
+    rating agency.
+
+As with the actors, we want this variable to be expressed in numerical
+form. Therefore, we will assign a number to each variable.
+
+```{r}
+# Map the certification categories to numerical values using case_when
+movie_data <- movie_data |> 
+  mutate(certification = case_when(
+    certification == "G" ~ 1,
+    certification == "PG" ~ 2,
+    certification == "PG-13" ~ 3,
+    certification == "R" ~ 4,
+    certification == "NC-17" ~ 5,
+    certification == "NR" ~ 6,
+    TRUE ~ NA_real_  # Keep NA values as NA
+  ))
+```
+
+The `certification` variable still contains **NA values**. We will not
+remove the films that have this value in the *certification* variable,
+but we will proceed with an imputation process. However, before
+performing this activity, we will remove some variables from our dataset
+that are no longer of interest.
+
+```{r}
+# Select specific columns and rearrange the dataset, removing unnecessary columns
+movie_data <- movie_data |> 
+  select(-c(id, 
+            original_title, 
+            release_date,
+            vote_count, 
+            vote_average, 
+            popularity,
+            overview,
+            tagline,
+            keywords,
+            genres,
+            production_companies,
+            cast,
+            crew, 
+            jobs, 
+            cast_genders, 
+            crew_genders)) |> 
+  select(title, everything()) # Place 'title' as the first column
+```
+
+Now we can proceed with **handling the missing values**. First, we will
+analyze the distribution of the `certification` variable.
+
+```{r}
+# Plot a histogram to visualize the distribution of the certification variable
+ggplot(movie_data, aes(`certification`)) +
+  geom_histogram(binwidth = 1, color = "blue", fill = "skyblue") +
+  ggtitle("Distribution of the Certification variable") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 18))
+```
+
+After completing this operation, we will select the **variables** that
+we consider **relevant**. These variables will be useful for the
+imputation of the variable in question.
+
+```{r}
+# Rename columns by replacing spaces with underscores for easier access
+colnames(movie_data) <- gsub(" ", "_", colnames(movie_data))
+
+# Prepare the dataset by selecting relevant columns, including genre indicators
+relevant_data <- movie_data |>  
+  select(certification,
+         budget,
+         revenue,
+         runtime,
+         overview_sentiment,
+         tagline_afinn,
+         Comedy,
+         Action,
+         Drama,
+         Thriller,
+         Adventure,
+         Science_Fiction,
+         Animation,
+         Family,
+         Romance,
+         Mystery,
+         Horror,
+         Fantasy,
+         War,
+         Music,
+         Western,
+         History,
+         Documentary,
+         TV_Movie)
+```
+
+After completing this operation, we can use different algorithms to
+perform the imputations. We have chosen to use two algorithms: **CART**
+and **Lasso**.
+
+```{r}
+# Impute missing certification values using the "cart" method (Classification and Regression Trees)
+mice_imputed_cart <- data.frame(
+  original = movie_data$certification,
+  imputed_cart = complete(mice(relevant_data, m=5, method = "cart", seed=123))$certification
+)
+
+# Impute missing certification values using the "lasso.norm" method (LASSO regression)
+mice_imputed_lasso <- data.frame(
+  original = movie_data$certification,
+  imputed_lasso = complete(mice(relevant_data, m=5, method = "lasso.norm", seed=123))$certification
+)
+```
+
+Now we can compare the different distributions resulting from the
+imputations. These distributions will help us choose the best algorithm
+for imputation. The algorithm whose distribution most closely matches
+the original one will be chosen as the imputation algorithm.
+
+```{r}
+# Define variables, titles, and colors for the updated set of distributions
+variables <- c("original", "imputed_cart", "imputed_lasso")
+titles <- c("Distribution of the Certification variable", 
+            "Cart-imputed distribution", 
+            "Lasso-imputed distribution")
+colors_fill <- c("skyblue", "#6a6ad9", "#e65100")
+colors_border <- c("blue", "pink", "#FF00FF")
+
+# Initialize an empty plot list for the new plots
+plots <- list()
+
+# Loop through the variables to create histograms for each distribution
+for (i in 1:length(variables)) {
+  plots[[i]] <- ggplot(data.frame(mice_imputed_cart, mice_imputed_lasso), aes(x = .data[[variables[i]]])) +
+    geom_histogram(binwidth = 1, fill = colors_fill[i], color = colors_border[i], position = "identity", na.rm = TRUE) +
+    ggtitle(titles[i]) +
+    theme_classic()
+}
+
+# Combine the plots into a grid layout for comparison
+plot_grid(plotlist = plots, ncol = 1, nrow = 3)
+```
+
+From the graphs, we can easily see that the best imputation method seems
+to be CART. Therefore, let’s proceed with the imputation of the NA
+values.
+
+```{r}
+# Replace missing values in the original certification column with the CART-imputed values
+imputed_certification <- mice_imputed_cart$imputed_cart
+
+movie_data$certification[is.na(movie_data$certification)] <- imputed_certification[is.na(movie_data$certification)]
+
+# Remove temporary variables and objects to clean up the environment
+rm(mice_imputed_cart)
+rm(mice_imputed_lasso)
+rm(plots)
+rm(relevant_data)
+rm(colors_border)
+rm(colors_fill)
+rm(i)
+rm(titles)
+rm(variables)
+rm(imputed_certification)
+```
+
+We have completed all operations on the variables.
+
+At this point, we can proceed to save the new dataset, which we will use
+for future analyses.
+
+```{r}
+# Save the final dataset to an Excel file
+write.xlsx(movie_data, "movie_data.xlsx", rowNames = FALSE)
+```
+
+# EDA
+
+Let’s now proceed with the exploratory data analysis.
+We will start with a descriptive analysis of the variables present in the dataset, and then perform some statistical tests.
+
+```{r}
+# Load necessary libraries
+library(readxl)  # For reading Excel files
+library(openxlsx)     # For writing Excel files
+library(dplyr)  # For data manipulation (part of the tidyverse)
+library(tidyr)  # For tidying data (part of the tidyverse)
+library(tidyverse)  # A collection of R packages for data science (includes dplyr, ggplot2, tidyr, etc.)
+library(ggplot2)  # For data visualization
+library(corrplot)  # For correlation matrix visualization
+library(purrr)  # For functional programming (part of the tidyverse)
+library(lubridate)  # For working with dates and times
+library(stats)  # Base R statistical functions
+library(car)  # For Levene’s test (used to assess the equality of variances)
+library(effectsize)  # For calculating effect sizes
+library(effsize)  # Another package for effect size calculations
+library(gridExtra)  # For arranging multiple plots in a grid
+```
+
+```{r}
+# Read in the Excel file containing the movie dataset
+movie_data <- read_excel("movie_data.xlsx")
+
+# Check for missing values in the entire dataset
+sum(is.na(movie_data))
+# Check for missing values in the Director_gender column
+sum(is.na(movie_data$Director_gender))
+# Check for missing values in the Screenplay_gender column
+sum(is.na(movie_data$Screenplay_gender))
+```
+
+Upon rechecking for NA values in the dataset, we found 3481 missing values.
+Previously, these NAs were not visible because the code left a blank space in case of missing gender, instead of inserting an NA.
+This issue concerns the absence of the director’s gender in 34 cases and the screenwriter’s gender in 3447 cases.
+What we are going to do is removing the observations where there is an NA for the `Director_gender` variable.
+We don't do the same for the screenwriters because, at the end, we are going to remove the variables related to this role.
+
+```{r}
+movie_data <- movie_data |> 
+  filter(!is.na(movie_data$Director_gender))
+```
+
+# Descriptive Analysis
+
+Regarding the descriptive analysis, we will proceed by examining the variables, starting from the first one and progressively moving to the right.
+
+## Title
+
+### Mean
+
+For these two variables, we will exclusively analyze the average number of words in the original and translated titles.
+
+```{r}
+# Calculate and print the mean number of words in the original title
+mean_nmb_wrd_orgnl = mean(movie_data$nmb_wrd_orgnl, na.rm = TRUE)
+cat("The average number of words in the original title is:", round(mean_nmb_wrd_orgnl, 2), "\n")
+
+# Calculate and print the mean number of words in the translated title
+mean_nmb_wrd_title = mean(movie_data$nmb_wrd_title, na.rm = TRUE)
+cat("The average number of words in the title is:", round(mean_nmb_wrd_title, 2), "\n")
+
+# Remove the mean variables from the environment to free up space
+rm(mean_nmb_wrd_orgnl)
+rm(mean_nmb_wrd_title)
+```
+
+## Title Sentiment
+
+### Mean
+
+Regarding the sentiment analysis of the title, we will start by examining the average AFINN score.
+
+```{r}
+# Calculate and print the mean sentiment analysis score for the title (using the AFINN method)
+mean_afinn_title = mean(movie_data$afinn_title, na.rm = TRUE)
+cat("The average sentiment analysis for the title is:", mean_afinn_title)
+
+# Remove the mean_afinn_title variable after use
+rm(mean_afinn_title)
+```
+
+As we might expect, the average Afinn scores are close to 0 (slightly negative).
+This indicates that, on average, the headlines contain neutral words.
+
+### vs Revenue/Budget Ratio
+
+Let’s delve deeper into the sentiment analysis of the title.
+We’ll start by graphically visualizing the relationship between the title’s sentiment and the ratio of a film’s revenue to its budget.
+
+```{r}
+# Plot the relationship between title sentiment and the revenue/budget ratio
+ggplot(movie_data, aes(x = as.numeric(afinn_title), y = rev_bud_ratio)) +
+  geom_point(color = "purple") +
+  labs(x = "Title Sentiment", y = "Revenue-Budget Ratio", 
+       title = "Title Sentiment vs Revenue/Budget Ratio") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Center and style the plot title
+    axis.title = element_text(size = 10)  # Adjust axis title font size
+  )
+```
+
+We observe that films with the highest ratio tend to have a neutral sentiment score, or at least not excessively negative or positive.
+
+### vs Year
+
+Let’s now examine the evolution of the sentiment of the titles over time.
+This will allow us to understand if there have been significant changes in the titles themselves, particularly if more impactful titles have been chosen from a communicative point of view.
+
+```{r}
+# Plot the trend of title sentiment over time (by year)
+ggplot(movie_data, aes(x = as.numeric(year), y = afinn_title)) +
+  geom_point() +
+  labs(x = "Year", y = "Title Sentiment", title = "Title Sentiment trend by Year") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),  # Center the title
+    axis.title = element_text(size = 10)  # Adjust axis title font size
+  )
+```
+
+Although not markedly, it is observed that the band of points tends to be a little bit wider over time.
+This suggests that, over the years, there has been an increasing number of titles with strong communicative effectiveness.
+It is likely that in the past there was greater control, perhaps even censorship, over the titles, which has gradually eased.
+Additionally, people have generally become more accustomed to strong sentiments associated with audiovisual works.
+
+### vs Certification
+
+Let’s now examine the relationship between the sentiment of the title and the rating of a film.
+
+```{r}
+# Plot the relationship between title sentiment and movie certification
+ggplot(movie_data, aes(x = factor(certification), y = afinn_title)) +
+  geom_jitter(aes(color = afinn_title), alpha = 0.6, width = 0.2) +  # Add jittered points colored by sentiment
+  geom_boxplot(alpha = 0.3, outlier.shape = NA) +  # Add transparent boxplots without outliers
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +  # Highlight the mean for each certification
+  scale_x_discrete(labels = c("G", "PG", "PG-13", "R", "NC-17", "NR")) +  # Rename certification labels
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +  # Color scale for sentiment
+  labs(x = "Certification", y = "Title Sentiment", 
+       title = "Title Sentiment by Certification",
+       color = "Sentiment") +
+  theme_minimal() +
+  theme(legend.position = "right") +  # Place legend on the right
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Center the plot title
+    axis.title = element_text(size = 10)  # Adjust axis title font size
+  )
+```
+
+It is observed that films with the lowest rating, that is, those suitable for all ages, generally have a title sentiment close to neutral.
+On the contrary, as the rating becomes more restrictive, the variability of the title sentiments increases.
+This suggests that films intended for a more mature audience can afford to use language that evokes stronger emotions.
+
+## Budget
+
+### Mean
+
+Also in this case, let’s start by analyzing the average of the budget variable.
+
+```{r}
+# Calculate the mean budget while ignoring missing values (NA)
+mean_budget = mean(movie_data$budget, na.rm = TRUE)
+cat("The average budget is:", mean_budget, "\n")
+
+# Remove the mean_budget variable after use
+rm(mean_budget)
+```
+
+The average budget is around 24 million dollars.
+
+### Distribution
+
+Let’s now examine the distribution of this variable.
+
+```{r}
+# Plot the distribution of movie budgets
+ggplot(movie_data, aes(x = budget)) +
+  geom_area(stat = "bin", bins = 50, fill = "darkblue", alpha = 1) +  # Use an area plot to show the budget distribution
+  scale_x_continuous(labels = scales::comma_format(scale = 1e-6, suffix = "M"),
+                     breaks = seq(0, 400e6, by = 100e6)) +  # Format x-axis in millions with "M" as the suffix
+  scale_y_continuous(labels = scales::comma_format(),
+                     breaks = seq(0, 3500, by = 1000)) +  # Format y-axis with commas
+  labs(title = "Budget Distribution",
+       x = "Budget ($)", 
+       y = "Number of Movies") +
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Center the title and style it
+    axis.title = element_text(size = 10),  # Adjust axis title font size
+    axis.text = element_text(size = 8)  # Adjust axis text font size
+  ) +
+  coord_cartesian(xlim = c(0, 400e6), ylim = c(0, 3500))  # Set limits for x and y axes to focus the plot
+```
+
+As expected, most films have a budget that is below or close to the average.
+As the budget increases, the number of films produced decreases.
+
+### vs Revenue
+
+Now let’s analyze the relationship between a film’s budget and its revenue.
+
+```{r}
+# Plot the relationship between budget and revenue
+ggplot(movie_data, aes(x = budget, y = revenue)) +
+  geom_point(alpha = 0.4, color = "darkred", size = 1.5) +  # Add scatterplot points
+  geom_smooth(method = "lm", color = "black", se = FALSE, size = 1) +  # Add a linear regression line without confidence intervals
+  scale_x_continuous(labels = scales::comma_format(scale = 1e-6, suffix = "M"),
+                     breaks = seq(0, 500e6, by = 100e6)) +  # Format x-axis in millions with "M" suffix
+  scale_y_continuous(labels = scales::comma_format(scale = 1e-6, suffix = "M"),
+                     breaks = seq(0, 3e9, by = 500e6)) +  # Format y-axis in billions with "M" suffix
+  labs(title = "Budget vs Revenue",
+       x = "Budget ($)",
+       y = "Revenue ($)") +
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Center the title and style it
+    plot.subtitle = element_text(hjust = 0.5, size = 12, color = "darkgrey"),  # Style the subtitle
+    axis.title = element_text(size = 10),  # Adjust axis title font size
+    axis.text = element_text(size = 8),  # Adjust axis text font size
+    panel.grid.minor = element_blank()  # Remove minor grid lines for clarity
+  ) +
+  coord_cartesian(ylim = c(0, 3e9), xlim = c(0, 450e6))  # Set limits for x and y axes to focus the plot
+```
+
+In the graph, the red line represents the trend or regression line, which highlights the general relationship between the budget and the revenue.
+The positive slope of the line indicates that, generally, as the budget increases, the revenue also increases.
+This line provides a visual estimate of the correlation between the two variables, allowing for a quick observation of the overall trend of the data, represented by the blue points in the graph.
+
+## Revenue
+
+### Mean
+
+Below is the code to calculate the average revenue.
+
+```{r}
+# Calculate the mean revenue while ignoring missing values (NA)
+mean_revenue = mean(movie_data$revenue, na.rm = TRUE)
+cat("The average revenue is:", mean_revenue, "\n")
+
+# Remove the mean_revenue variable after use
+rm(mean_revenue)
+```
+
+The average revenue of a film is approximately 67 million dollars.
+As expected, this figure is significantly higher than the average budget.
+
+### Distribution
+
+Now let’s analyze the distribution of this variable:
+
+```{r}
+# Plot the distribution of movie revenues
+ggplot(movie_data, aes(x = revenue)) +
+  geom_area(stat = "bin", bins = 50, fill = "darkred", alpha = 1) +  # Use an area plot to show the revenue distribution
+  scale_x_continuous(labels = scales::comma_format(scale = 1e-6, suffix = "M"),
+                     breaks = seq(0, 1200e6, by = 100e6)) +  # Format x-axis in millions with "M" as the suffix
+  scale_y_continuous(labels = scales::comma_format(),
+                     breaks = seq(0, 6500, by = 1000)) +  # Format y-axis with commas
+  labs(title = "Revenue Distribution",
+       x = "Revenue ($)", 
+       y = "Number of Movies") +
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Center the title and style it
+    axis.title = element_text(size = 10),  # Adjust axis title font size
+    axis.text = element_text(size = 8)  # Adjust axis text font size
+  ) +
+  coord_cartesian(xlim = c(0, 1200e6), ylim = c(0, 6500))  # Set limits for x and y axes to focus the plot
+```
+
+Similarly to what was observed for the budget variable, we also notice that most films have a revenue that is below or close to the average.
+Moving to the right in the graph, that is, examining the number of films with very high revenues, we observe a rapid decrease in the number of films.
+
+## Revenue/Budget Ratio
+
+### Mean
+
+```{r}
+# Calculate the mean revenue-to-budget ratio while ignoring missing values (NA)
+mean_rev_bud_ratio = mean(movie_data$rev_bud_ratio, na.rm = TRUE)
+cat("The average revenue/budget ratio is:", round(mean_rev_bud_ratio, 2))
+
+# Remove the mean_rev_bud_ratio variable after use
+rm(mean_rev_bud_ratio)
+```
+
+We observe that the average value of the ratio between revenue and budget is 5.76.
+This means that, on average, a film earns around 5 times its budget.
+It is evident that this is a very satisfactory result.
+
+### vs Year
+
+Now let’s analyze the trend of the ratio between revenue and budget over time.
+
+```{r}
+# Ensure the 'year' column is treated as numeric
+movie_data <- movie_data |> 
+  mutate(year = as.numeric(year))
+
+# Plot the revenue-to-budget ratio over time (by year)
+ggplot(movie_data, aes(x = year, y = rev_bud_ratio)) +
+  geom_point(color = "purple") +  # Add scatterplot points
+  scale_x_continuous(breaks = seq(min(movie_data$year), 
+                                  max(movie_data$year), 
+                                  by = 10)) +  # Set x-axis breaks every 10 years
+  labs(title = "Revenue/Budget Ratio Over Time",
+       x = "Year",
+       y = "Revenue / Budget") +
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Center the title and style it
+    axis.title = element_text(size = 10),  # Adjust axis title font size
+    axis.text = element_text(size = 8)  # Adjust axis text font size
+  )
+```
+
+It can be observed that, generally, over the years, this ratio has increased, with some films recording extremely high values.
+The reasons for this phenomenon can be manifold.
+Firstly, over time, cinema has become an increasingly well-known and accessible service.
+Another explanation could lie in the emergence of new mass media, such as television first and then the internet, which have made advertising and word-of-mouth, and therefore virality, much more effective, thus increasing the number of viewers for a particular film.
+
+## Date
+
+### Film count per month
+
+Let’s start by counting the number of films released each month.
+
+```{r}
+# Number of movies per month
+month_names <- c("January", "February", "March", "April", "May", "June", 
+                 "July", "August", "September", "October", "November", "December")
+
+# Count the number of movies released each month
+films_per_month <- movie_data |> 
+  count(month) |> 
+  arrange(month) |> 
+  mutate(month_name = factor(month_names, levels = month_names))
+
+# Plot the number of movies released per month
+ggplot(films_per_month, aes(x = n, y = month_name)) +
+  geom_col(fill = "skyblue", color = "black") +  # Create a bar plot with skyblue bars
+  theme_minimal() +  # Use a minimal theme for a clean look
+  labs(title = "Number of Movies per Month",
+       x = "Number of Movies",
+       y = "Month") +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Center and style the title
+        axis.text.y = element_text(hjust = 1, face = "italic")) +  # Italicize the y-axis text
+  scale_x_continuous(expand = c(0, 0), 
+                     limits = c(0, max(films_per_month$n) * 1.1),  # Set x-axis limits to be slightly wider than max count
+                     breaks = seq(0, 1200, by = 200))  # Set x-axis breaks every 200 units
+
+# Remove unnecessary variables from the environment
+rm(films_per_month)
+rm(month_names)
+```
+
+We observe that the months with the highest number of film releases are the final months of the year.
+The reasons can be various.
+Firstly, during these months it starts to get colder, and going to the cinema can be a good alternative to other outdoor activities.
+Additionally, during this period there are many holidays, such as Halloween and Christmas, which can lead to an increase in cinema attendance.
+
+### Month vs Revenue
+
+Now let’s analyze the relationship between the release month of a film and its earnings.
+
+```{r}
+month_names <- c("January", "February", "March", "April", "May", "June", 
+                 "July", "August", "September", "October", "November", "December")
+
+# Calculate the average revenue for each month and sort in descending order
+monthly_revenue <- movie_data |> 
+  group_by(month) %>%
+  summarise(avg_revenue = mean(revenue, na.rm = TRUE)) %>%
+  arrange(desc(avg_revenue))
+
+# Convert the month column to a factor ordered by the month names
+monthly_revenue$month <- factor(month_names[as.numeric(monthly_revenue$month)], 
+                                levels = month_names[as.numeric(monthly_revenue$month)])
+
+# Plot the average revenue by month
+ggplot(monthly_revenue, aes(x = avg_revenue, y = month)) +
+  geom_bar(stat = "identity", fill = "darkred") +  # Create a bar plot with darkred bars
+  labs(title = "Average Revenue by Month",
+       x = "Average Revenue",
+       y = "Month") +
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),  # Center and style the title
+        axis.text.y = element_text(hjust = 1, face = "italic")) +  # Italicize the y-axis text
+  scale_x_continuous(labels = scales::label_number(suffix = "M", scale = 1e-6))  # Format x-axis labels in millions with "M" suffix
+
+# Remove unnecessary variables from the environment
+rm(monthly_revenue)
+rm(month_names)
+```
+
+We observe that the most profitable months are June, July, and May, which are the summer months.
+This dataset is mainly composed of American films, and in the USA, the summer period is one of the favorite times to go to the cinema.
+This may also be due to the fact that, during the summer, people seek relief in air-conditioned cinemas, in a logic similar to that of winter releases.
+In fact, right after these three months, we notice that the most profitable months are December and November, when it is colder and there are holidays like Christmas.
+
+## IP
+
+### Mean
+
+Let’s start by analyzing the proportion of films that are derived from other works, such as books, short stories, or video games.
+
+```{r}
+# Calculate the mean proportion of movies stemming from other works (IP) and display it
+mean_ip = mean(movie_data$IP, na.rm = TRUE)
+cat("The ", round(mean_ip*100, 2), "% of movies in the dataset stems from other works", sep = "")
+
+# Remove the mean_ip variable after use
+rm(mean_ip)
+```
+
+### vs Year
+
+Now let’s examine the evolution of films based on intellectual property (IP) over the year
+
+```{r}
+# Calculate the proportion of IP films by year
+proportion_by_year <- movie_data |> 
+  group_by(year) |> 
+  summarise(proportion = mean(IP, na.rm = TRUE))
+
+# Plot the evolution of the proportion of IP films over time
+ggplot(proportion_by_year, aes(x = year, y = proportion)) +
+  geom_line() +
+  geom_point() +
+  labs(x = "Year", 
+       y = "Proportion of IP films",
+       title = "Evolution of the Proportion of IP Films Over Time") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(min(proportion_by_year$year), 
+                                  max(proportion_by_year$year), 
+                                  by = 10))  # Set x-axis breaks every 10 years
+
+# Remove the proportion_by_year variable after use
+rm(proportion_by_year)
+```
+
+In the early 20th century, the representation is quite peculiar, mainly because the dataset contains very few films from that period.
+However, we observe that, as time goes by, the proportion of films derived from other works has progressively decreased.
+
+### vs Revenue
+
+Let’s examine whether this gradual reduction is due to the fact that, on average, films based on intellectual property (IP) earn less compared to non-IP films.
+
+```{r}
+# Calculate the average revenue for IP and non-IP films
+revenue_by_ip <- movie_data |> 
+  group_by(IP) |> 
+  summarise(mean_revenue = mean(revenue, na.rm = TRUE)) |> 
+  mutate(ip_status = ifelse(IP == 1, "IP", "NOT IP"))
+
+# Plot the average revenue per IP and non-IP film
+ggplot(revenue_by_ip, aes(x = ip_status, y = mean_revenue, fill = ip_status)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  labs(x = "IP Status", 
+       y = "Average Revenue", 
+       title = "Average Revenue per IP and Non-IP Film") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold")) +
+  scale_y_continuous(labels = scales::label_number(suffix = "M", scale = 1e-6)) +
+  scale_fill_manual(values = c("NOT IP" = "#7fcdbb", "IP" = "#2c7fb8")) +  # Set custom colors for IP status
+  theme(legend.position = "none")  # Remove the legend
+
+# Remove the revenue_by_ip variable after use
+rm(revenue_by_ip)
+```
+
+Surprisingly, we notice that IP films earn more on average compared to non-IP films.
+Therefore, the decline over time might be attributed to other causes, such as copyright issues and the high costs of acquiring a work.
+
+## Overview Sentiment
+
+We always start from the average.
+
+```{r}
+# Calculate the mean overview sentiment score and display it
+mean_overview = mean(movie_data$overview_sentiment, na.rm = TRUE)
+cat("The average overview sentiment is:", mean_overview)
+
+# Remove the mean_overview variable after use
+rm(mean_overview)
+```
+
+Similarly to titles, movie plots also tend to have an average score close to neutral, that is, around 0, although in this case the value deviates slightly more.
+
+### Distribution
+
+Now let’s examine the distribution of this variable.
+
+```{r}
+# Plot the distribution of overview sentiment scores
+ggplot(movie_data, aes(x = overview_sentiment)) +
+  geom_histogram(binwidth = 1, fill = "#31a354", alpha = 1) +
+  labs(title = "Overview Sentiment Distribution",
+       x = "Overview Sentiment", 
+       y = "Number of Movies") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+```
+
+The distribution is very close to a normal distribution.
+In fact, we notice that most films have a sentiment associated with the plot that is neutral or not particularly strong.
+This is predictable, as films with too intense emotions can be overwhelming or even cloying, thus discouraging people from going to the cinema.
+
+### vs Year
+
+Now let’s examine if and how the sentiment in movie plots has changed over the years.
+
+```{r}
+# Plot overview sentiment scores by year
+ggplot(movie_data, aes(x = as.numeric(year), y = overview_sentiment)) +
+  geom_point() +
+  labs(x = "Year", 
+       y = "Overview Sentiment", 
+       title = "Overview Sentiment by Year") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+```
+
+Similarly to what was observed for the sentiment of titles, movie plots have also started to express increasingly intense emotions over time.
+This could be due to the fact that the audience has become accustomed to softer stories, preferring instead more gripping plots.
+
+### vs Revenue/Budget Ratio
+
+Now let’s compare the sentiment of the overview with the revenue-to-budget ratio.
+
+```{r}
+# Plot the relationship between overview sentiment and the revenue-to-budget ratio
+ggplot(movie_data, aes(x = as.numeric(overview_sentiment), y = rev_bud_ratio)) +
+  geom_point(color = "purple") +
+  labs(x = "Overview Sentiment", 
+       y = "Revenue-Budget Ratio", 
+       title = "Revenue/Budget Ratio vs Overview Sentiment") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+```
+
+We observe that films with a higher revenue-to-budget ratio tend to have a neutral overview or values that are not too extreme.
+
+## Original Language
+
+### Mean
+
+For this variable, we analyze only the proportion of films with English as the original language.
+The American market has the strongest film industry and also provides the most data on produced films.
+Consequently, most of the films in our dataset come from the USA, and we expect the proportion of films with English as the original language to be skewed in favor of the latter.
+
+```{r}
+# Calculate the percentage of movies with English as the original language and display it
+mean_original_language = round(mean(movie_data$original_language), 2) * 100
+cat("The ", mean_original_language, "% of movies has English as the original language", sep = "")
+
+# Remove the mean_original_language variable after use
+rm(mean_original_language)
+```
+
+Indeed, the percentage is very high, as expected.
+
+## Spoken Languages
+
+### Mean
+
+Now let’s analyze, on average, how many languages are spoken in a film.
+
+```{r}
+# Calculate the mean number of spoken languages per movie and display it
+mean_spoken = round(mean(movie_data$nmb_spoken_languages, na.rm = TRUE), 2)
+cat("The average number of spoken languages is:", mean_spoken)
+
+# Remove the mean_spoken variable after use
+rm(mean_spoken)
+```
+
+In fact, on average, fewer than two languages are spoken in a film.
+
+### Revenue
+
+Let’s now examine the relationship between the number of languages spoken in a film and its box office revenue.
+
+```{r}
+# Plot the relationship between the number of spoken languages and revenue
+ggplot(movie_data, aes(x = nmb_spoken_languages, y = revenue)) +
+  geom_point(alpha = 0.5, color = "darkred") +
+  scale_y_continuous(labels = scales::comma_format(scale = 1e-6, suffix = "M"),
+                     breaks = seq(0, 3e9, by = 500e6)) +
+  scale_x_continuous(breaks = seq(0, max(movie_data$nmb_spoken_languages, na.rm = TRUE), by = 1)) +
+  labs(title = "Number of Languages vs Revenue",
+       x = "Number of Spoken Languages",
+       y = "Revenue ($)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+```
+
+We observe that, with the exception of some outliers, films in which fewer languages are spoken tend to have higher box office revenues.
+This could be because a greater number of spoken languages requires more cognitive effort from the viewer.
+
+## Runtime
+
+### Mean
+
+For the runtime variable as well, let’s start by analyzing its average.
+
+```{r}
+# Calculate the mean runtime and display it
+mean_runtime = mean(movie_data$runtime, na.rm = TRUE)
+cat("The average runtime in minutes is:", round(mean_runtime, 0))
+
+# Remove the mean_runtime variable after use
+rm(mean_runtime)
+```
+
+We observe that, on average, the films produced have a runtime slightly under two hours.
+
+### Distribution
+
+Now let’s analyze the distribution of the “runtime” variable.
+
+```{r}
+# Plot the distribution of runtimes
+ggplot(movie_data, aes(x = runtime)) +
+  geom_area(stat = "bin", bins = 50, fill = "#feb24c", alpha = 1) +
+  labs(title = "Runtime Distribution",
+       x = "Minutes", 
+       y = "Number of Movies") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  ) 
+```
+
+As we can observe, most films have a runtime of less than 130 minutes, while only a few significantly exceed two hours.
+These longer films are less accessible to the audience, as they require a greater time commitment to be watched in theaters.
+Additionally, long-duration films often require greater cognitive effort and attention, increasing the risk of becoming boring.
+
+### vs Certification
+
+Let’s graphically examine the relationship between a film’s runtime and its rating.
+
+```{r}
+# Plot runtime versus certification categories
+ggplot(movie_data, aes(x = factor(certification), y = runtime)) +
+  geom_boxplot() +
+  labs(title = "Runtime vs Certification",
+       x = "Certification", 
+       y = "Minutes") +
+  scale_x_discrete(labels = c("1" = "G", "2" = "PG", "3" = "PG-13", "4" = "R", "5" = "NC-17", "6" = "NR")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+```
+
+The image shows the distribution of film runtimes for different certifications.
+We observe a general trend of increasing median film duration with higher certification numbers, with categories PG-13 and NC-17 having higher medians.
+All categories have outliers, i.e., films with exceptionally long durations, but these are more evident in the higher categories.
+Category G, presumably corresponding to children’s or family films, shows the lowest median duration and the least variability, suggesting greater uniformity in the length of these films.
+The intermediate categories show a gradual progression in duration, while higher categories seem to have a wider distribution, indicating greater flexibility in runtime for films with these certifications.
+This analysis suggests a correlation between the type of certification and the film’s duration, likely reflecting audience expectations and genre conventions associated with each rating category.
+
+### vs Revenue
+
+Now let’s analyze the relationship between the duration of a movie and its earnings.
+
+```{r}
+# Plot the relationship between runtime and revenue
+ggplot(movie_data, aes(x = runtime, y = revenue)) +
+  geom_point(alpha = 0.5, color = "darkred") +
+  scale_y_continuous(labels = scales::comma_format(scale = 1e-6, suffix = "M"),
+                     breaks = seq(0, 3e9, by = 500e6)) +
+  scale_x_continuous(breaks = seq(0, max(movie_data$runtime, na.rm = TRUE), by = 50)) +
+  labs(title = "Runtime vs Revenue",
+       x = "Minutes",
+       y = "Revenue ($)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+```
+
+As we can easily observe, and as one might expect, the highest earnings are obtained from movies with a duration between 100 and 200 minutes.
+When the duration significantly exceeds three hours, the movie’s earnings decrease considerably.
+
+### vs Year
+
+Now let’s examine how the duration of movies has changed over time.
+
+```{r}
+# Plot runtime trend over the years
+ggplot(movie_data, aes(x = as.numeric(year), y = runtime)) +
+  geom_point() +
+  labs(x = "Year", y = "Minutes", title = "Runtime Trend by Year") +
+  scale_x_continuous(breaks = seq(min(movie_data$year), 
+                                  max(movie_data$year), 
+                                  by = 10)) +
+  scale_y_continuous(breaks = seq(min(movie_data$runtime, na.rm = TRUE),
+                                  max(movie_data$runtime, na.rm = TRUE),
+                                  by = 50)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+```
+
+We observe that, over the years, although not markedly, the number of movies with a longer duration has slightly increased.
+The reasons for this phenomenon can be manifold, ranging from artistic to technical motivations.
+For example, in the past, movies were shot exclusively on film, which was very expensive, and this limited the duration of movies.
+Today, however, most movies are made in digital format, where the only limit to the duration is the digital memory capacity.
+
+## Tagline
+
+### (Sentiment) Distribution
+
+First, let’s analyze the distribution of sentiment related to the tagline.
+
+```{r}
+# Plot the distribution of tagline sentiment scores
+ggplot(movie_data, aes(x = tagline_afinn)) +
+  geom_histogram(binwidth = 1, fill = "dodgerblue3", alpha = 1) +
+  scale_x_continuous(breaks = seq(min(movie_data$tagline_afinn, na.rm = TRUE),
+                                  max(movie_data$tagline_afinn, na.rm = TRUE),
+                                  by = 1)) +
+  scale_y_continuous(labels = scales::comma_format(),
+                     breaks = seq(0, 6000, by = 500)) +
+  labs(title = "Tagline Sentiment Distribution",
+       x = "Tagline Sentiment", 
+       y = "Number of Movies") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  ) 
+```
+
+### vs Revenue
+
+Similarly to what was done for the sentiment related to the overview, we also examine the relationship between the sentiment of the tagline and the revenue.
+
+```{r}
+# Plot the relationship between tagline sentiment and revenue/budget ratio
+ggplot(movie_data, aes(x = as.numeric(tagline_afinn), y = rev_bud_ratio)) +
+  geom_point(color = "purple") +
+  labs(x = "Tagline Sentiment", 
+       y = "Revenue-Budget Ratio", 
+       title = "Revenue/Budget Ratio vs Tagline Sentiment") +
+  scale_x_continuous(breaks = seq(min(movie_data$tagline_afinn, na.rm = TRUE),
+                                  max(movie_data$tagline_afinn, na.rm = TRUE),
+                                  by = 1)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  ) 
+```
+
+In this case as well, movies with a more neutral tagline generally present a higher level of revenue.
+
+## Collection
+
+### Mean
+
+Let’s start by analyzing the proportion of movies in our dataset that are part of a collection.
+
+```{r}
+# Calculate the percentage of movies belonging to a collection and display it
+mean_collection = mean(movie_data$belongs_to_collection, na.rm = TRUE)
+cat("The ", round(mean_collection * 100, 2), "% of movies in the dataset belongs to a collection", sep = "")
+
+# Remove the mean_collection variable after use
+rm(mean_collection)
+```
+
+### vs Year
+
+Next, we examine how this proportion has changed over the years.
+
+```{r}
+# Calculate the proportion of movies belonging to a collection per year
+proportion_by_year <- movie_data |> 
+  group_by(year) |> 
+  summarise(proportion = mean(belongs_to_collection, na.rm = TRUE))
+
+# Create a line chart showing the evolution of the proportion of movies belonging to a collection over time
+ggplot(proportion_by_year, aes(x = year, y = proportion)) +
+  geom_line() +
+  geom_point() +
+  labs(x = "Year", 
+       y = "Proportion of films belonging to a collection",
+       title = "Evolution of the proportion of films belonging to a collection over time") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(min(proportion_by_year$year), 
+                                  max(proportion_by_year$year), 
+                                  by = 10)) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+
+# Remove the proportion_by_year variable after use
+rm(proportion_by_year)
+```
+
+Except for some values in the first half of the 20th century, where the high proportion is mainly due to the low number of movies produced in those years, we observe a general upward trend.
+This result is quite logical: over time, the number of successful movies increases, and therefore producers are more inclined to start or continue sagas, as they represent a relative guarantee of profit.
+
+### vs Revenue
+
+Let’s examine whether the increase over time in movies belonging to collections is supported by an increase in revenue.
+
+```{r}
+# Calculate the average revenue for movies that belong to a collection and those that don't
+revenue_by_collection <- movie_data |> 
+  group_by(belongs_to_collection) |> 
+  summarise(mean_revenue = mean(revenue, na.rm = TRUE)) |> 
+  mutate(collection_status = ifelse(belongs_to_collection == 1, 
+                                    "Belongs to collection", 
+                                    "Doesn't belong to collection"))
+
+# Create a bar chart comparing the average revenue between collection and non-collection movies
+ggplot(revenue_by_collection, aes(x = collection_status, y = mean_revenue, fill = collection_status)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  labs(x = "Collection Status", 
+       y = "Average Revenue", 
+       title = "Average revenue per collection and non-collection movies") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::label_number(suffix = "M", scale = 1e-6)) +
+  scale_fill_manual(values = c("Doesn't belong to collection" = "#c994c7", 
+                               "Belongs to collection" = "#dd1c77")) +
+  theme(legend.position = "none")
+
+# Remove the revenue_by_collection variable after use
+rm(revenue_by_collection)
+```
+
+As expected, the average income of movies that are part of a collection is significantly higher compared to those that are not.
+In fact, movies in a saga, although not having a mathematical certainty, have a much higher probability of achieving guaranteed earnings, as they can rely on a loyal viewer base.
+
+## Production Countries
+
+### Mean
+
+As previously observed for the variable *original language*, a predominance of films produced in the **United States** was expected.
+
+```{r}
+# Calculate the percentage of movies produced in the USA
+mean_country = round(mean(movie_data$production_countries, na.rm = TRUE), 2) * 100
+cat("The ", mean_country, "% of movies is produced in USA", sep = "")
+
+# Remove the mean_country variable after use
+rm(mean_country)
+```
+
+The results obtained fully confirm these expectations.
+
+## Certification
+
+### Frequency
+
+Let’s start by analyzing the number of films associated with each rating.
+
+```{r}
+# Plot the frequency of movie ratings
+movie_data |> 
+  count(certification) |> 
+  mutate(
+    certification = factor(certification, levels = c("1", "2", "3", "4", "5", "6"),
+                           labels = c("G", "PG", "PG-13", "R", "NC-17", "NR"))
+  ) |> 
+  ggplot(aes(x = certification, y = n)) +
+  geom_col(fill = "skyblue") +
+  labs(title = "Frequency of Movie Ratings",
+       x = "Rating",
+       y = "Number of Movies") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+```
+
+It is observed that the rating with the highest number of films is the **R** rating, which stands for ***restricted***.
+
+### vs Revenue/Budget Ratio
+
+Let’s now examine whether R-rated films have the best revenue-to-budget ratio.
+If this were the case, it would immediately explain why so many R-rated films are produced.
+
+```{r}
+# Calculate the average revenue/budget ratio by movie certification
+certification_revenue <- movie_data |> 
+  group_by(certification) |> 
+  summarise(avg_rev_bud_ratio = mean(rev_bud_ratio, na.rm = TRUE)) |> 
+  mutate(certification = factor(certification,
+                                levels = c("1", "2", "3", "4", "5", "6"),
+                                labels = c("G", "PG", "PG-13", "R", "NC-17", "NR")))
+
+# Create a bar chart showing the average revenue/budget ratio by certification
+ggplot(certification_revenue, aes(x = certification, y = avg_rev_bud_ratio)) +
+  geom_bar(stat = "identity", fill = "purple") +
+  scale_y_continuous(breaks = seq(min(movie_data$rev_bud_ratio),
+                                  max(movie_data$rev_bud_ratio),
+                                  by = 10)) +
+  labs(title = "Average Revenue/Budget Ratio by Certification",
+       x = "Certification",
+       y = "Average Revenue/Budget Ratio") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+
+# Remove the certification_revenue variable after use
+rm(certification_revenue)
+```
+
+We observe that R-rated films have a lower revenue-to-budget ratio compared to NC-17 and G-rated films.
+NC-17 films are often low-budget, like many horror films, which can rely on word-of-mouth and virality, as they are often associated with strong emotions like fear.
+This value could be determined by a few films that, with a very low budget, have become real success stories, earning a lot.
+On the other hand, the second genre with the best revenue-to-budget ratio is easily explained: G-rated films.
+These films can be watched by people of all ages, including very young children, which greatly expands the potential audience, leading to high revenues.
+So, why is the most produced rating R?
+Probably because films are also made for artistic reasons, and many directors and crew members are willing to create a film that, while not having the most profitable rating, satisfies their artistic needs.
+
+### vs Budget
+
+Finally, let’s analyze which film ratings receive the most investment.
+
+```{r}
+# Calculate the average budget by movie certification
+certification_budget <- movie_data |> 
+  group_by(certification) |> 
+  summarise(avg_budget = mean(budget, na.rm = TRUE)) |> 
+  mutate(certification = factor(certification,
+                                levels = c("1", "2", "3", "4", "5", "6"),
+                                labels = c("G", "PG", "PG-13", "R", "NC-17", "NR")))
+
+# Create a bar chart showing the average budget by certification
+ggplot(certification_budget, aes(x = certification, y = avg_budget)) +
+  geom_bar(stat = "identity", fill = "darkblue") +
+  labs(title = "Average Budget by Certification",
+       x = "Certification",
+       y = "Average Budget ($)") +
+  theme_minimal() +
+  scale_y_continuous(labels = function(x) paste0(x / 1e6, "M")) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+
+# Remove the certification_budget variable after use
+rm(certification_budget)
+```
+
+It is observed that films with the highest investments are those with a relatively low rating.
+These films, compared to those with a higher rating, allow for reaching a wider potential audience.
+Consequently, film production companies and investors are more inclined to invest their money in these projects.
+
+## Genres
+
+### Genre Count
+
+To begin, let’s count the number of films for each genre.
+It’s important to remember that a film can belong to more than one genre.
+Therefore, we expect to find a higher number of films in more general genres, such as *Drama* or *Action*, which can include more specific genres like *Horror*.
+
+```{r}
+# Count of movies by genre
+# Select the genre columns and transform the data into a long format
+genre_counts <- movie_data |> 
+  select(Comedy, Action, Crime, Thriller, Adventure, Science_Fiction, 
+         Animation, Family, Drama, Romance, Mystery, Horror, Fantasy, 
+         War, Music, Western, History, Documentary, TV_Movie) |> 
+  pivot_longer(cols = everything(), names_to = "Genre", values_to = "Count") |> 
+  mutate(Genre = str_replace_all(Genre, "_", " ")) |>  # Replace underscores with spaces in genre names
+  group_by(Genre) %>%
+  summarise(Total = sum(Count)) %>%  # Sum the counts for each genre
+  arrange(desc(Total))  # Sort genres by total count in descending order
+
+# Plot a bar chart of the number of movies per genre
+ggplot(genre_counts, aes(x = reorder(Genre, -Total), y = Total)) +
+  geom_bar(stat = "identity", fill = "chocolate") +
+  theme_minimal() +
+  labs(title = "Number of movies per genre",
+       x = "Genre",
+       y = "Number of movies") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  ) +
+  coord_flip()  # Flip the coordinates for better readability
+
+# Remove the temporary genre_counts data
+rm(genre_counts)
+```
+
+Indeed, we notice that the three most common genres are *Drama*, *Comedy*, and *Action*.
+As mentioned earlier, being very broad genres, they can also encompass more specific genres.
+
+### vs Revenue
+
+Let’s now examine the relationship between different film genres and the revenue generated.
+
+```{r}
+# Transform the data into long format for genre analysis
+movie_genres_long <- movie_data |> 
+  pivot_longer(cols = Comedy:TV_Movie, names_to = "genre", values_to = "is_genre") |> 
+  filter(is_genre == 1) |>  # Consider only movies that belong to a specific genre
+  mutate(genre = str_replace_all(genre, "_", " "))  # Replace underscores with spaces in genre names
+
+# Box plot of revenue by genre
+ggplot(movie_genres_long, aes(x = genre, y = revenue)) +
+  geom_boxplot(color = "darkred") +
+  scale_y_log10(labels = function(x) paste0(x / 1e6, "M")) +  # Log scale for revenue, labeled in millions
+  labs(title = "Distribution of Revenue by Genre",
+       x = "Genre", 
+       y = "Revenue (log scale)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+        axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate genre names on the x-axis
+        axis.title = element_text(size = 10))
+
+# Remove the temporary movie_genres_long data
+rm(movie_genres_long)
+```
+
+The graph clearly shows that genres such as Action, Adventure, Science Fiction, Animation, and Family are generally associated with higher revenues, with a wider distribution of earnings.
+On the contrary, as one might expect, genres like Documentary and TV Movies tend to generate lower and less variable revenues.
+This suggests that the financial success of a film can be strongly influenced by its genre, with some genres offering greater opportunities for high earnings compared to others.
+
+### vs Revenue/Budget Ratio
+
+Let’s now consider the relationship between film genres and the ratio of revenue to budget.
+It is possible that some genres, despite having a lower average revenue in absolute terms, present a higher revenue-to-budget ratio.
+
+```{r}
+# List of genres
+genres <- c("Comedy", "Action", "Crime", "Thriller", "Adventure", "Science_Fiction", "Animation", "Family", "Drama", "Romance", "Mystery", "Horror", "Fantasy", "War", "Music", "Western", "History", "Documentary", "TV_Movie")
+
+# Calculate the average revenue/budget ratio for each genre
+genre_data <- genres %>%
+  map_df(function(genre) {
+    movie_data %>%
+      filter(!!sym(genre) == 1) %>%
+      summarise(avg_ratio = mean(rev_bud_ratio, na.rm = TRUE)) %>%
+      mutate(genre = str_replace_all(genre, "_", " "))  # Replace underscores with spaces in genre names
+  })
+
+# Sort the data by avg_ratio in descending order
+genre_data <- genre_data %>% arrange(desc(avg_ratio))
+
+# Create a bar chart of average revenue/budget ratio by genre
+ggplot(genre_data, aes(x = avg_ratio, y = reorder(genre, avg_ratio))) +
+  geom_bar(stat = "identity", fill = "purple") +
+  labs(title = "Average Revenue/Budget Ratio by Genre",
+       x = "Revenue/Budget Ratio",
+       y = "Genre") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+        axis.text.x = element_text(hjust = 1),
+        axis.title = element_text(size = 10))
+
+# Remove the temporary genre_data and genres variables
+rm(genre_data)
+rm(genres)
+```
+
+In fact, we notice that the genre with the highest ratio is Documentary, followed by more specific genres like Horror and Music.
+These films tend to have lower budgets compared to genres like Drama or Action.
+This may be due to the fact that the highest-paid stars often prefer to work in more popular genres, such as those mentioned, significantly increasing the film’s budget.
+
+## Cast
+
+Regarding the variable related to the cast, we will specifically analyze the gender of the actors.
+In particular, we will conduct an analysis on the possible combinations of the two main actors in the film: male-male, male-female, female-male, and female-female.
+For each combination, we will examine the number of films made, the average revenue, the average budget, and the average revenue-to-budget ratio.
+
+### Gender Analysis
+
+```{r}
+# Function to convert numerical values into gender initials
+gender_to_initial <- function(x) {
+  ifelse(x == 1, "M", ifelse(x == 0, "F", as.character(x)))
+}
+
+# Prepare data for analyzing star gender combinations
+gender_data <- movie_data %>%
+  mutate(
+    combination = paste(
+      gender_to_initial(Star_gender1),  # Convert the first star's gender to initials
+      gender_to_initial(Star_gender2),  # Convert the second star's gender to initials
+      sep = "-"
+    )
+  ) %>%
+  group_by(combination) %>%
+  summarise(
+    count = n(),  # Count the number of movies for each combination
+    avg_revenue = mean(revenue, na.rm = TRUE),  # Calculate the average revenue
+    avg_budget = mean(budget, na.rm = TRUE),  # Calculate the average budget
+    avg_rev_bud_ratio = mean(rev_bud_ratio, na.rm = TRUE)  # Calculate the average revenue/budget ratio
+  ) %>%
+  pivot_longer(cols = c(count, avg_revenue, avg_budget, avg_rev_bud_ratio),
+               names_to = "metric", values_to = "value")  # Reshape the data into a long format
+
+# Create a plot with specific colors for each metric and no legend
+ggplot(gender_data, aes(x = combination, y = value, fill = metric)) +
+  geom_bar(stat = "identity", color = "black") +
+  facet_wrap(~ metric, scales = "free_y", nrow = 2, ncol = 2,  # Split the plot by metric, with separate y-scales
+             labeller = labeller(metric = c(
+               "count" = "Number of movies",
+               "avg_revenue" = "Average Revenue",
+               "avg_budget" = "Average Budget",
+               "avg_rev_bud_ratio" = "Average Rev/Bud Ratio"
+             ))) +
+  theme_minimal() +
+  labs(
+    title = "Metrics for Star Gender Combination",
+    x = "Gender Combination",
+    y = ""
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate gender combinations for readability
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+    strip.background = element_rect(fill = "lightgray"),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"  # Remove the legend
+  ) +
+  scale_x_discrete(limits = c("M-M", "M-F", "F-F", "F-M")) +  # Set the order of the gender combinations
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +  # Format y-axis labels
+  scale_fill_manual(values = c(
+    "avg_rev_bud_ratio" = "purple",  # Darker purple for avg_rev_bud_ratio
+    "avg_revenue" = "darkred",       # Darker red for avg_revenue
+    "avg_budget" = "darkblue",       # Darker blue for avg_budget
+    "count" = "darkgreen"            # Darker green for count
+  ), guide = "none")  # Disable the legend
+
+# Clean up temporary variables
+rm(gender_data)
+rm(gender_to_initial)
+```
+
+In general, we note that the presence of a male actor among the protagonists is associated with a higher number of films, a higher average revenue, and a higher average budget.
+However, the films that present the highest revenue-to-budget ratio are those in which the main star is female and the secondary star is male.
+
+## Crew
+
+### Director gender
+
+Let’s now examine the differences that emerge when a director is male compared to when a director is female.
+In particular, we will analyze the number of films made by male and female directors, their average revenue, the average budget, and finally the average revenue-to-budget ratio.
+
+```{r}
+# Function to convert numeric values to gender initials
+gender_to_initial <- function(x) {
+  ifelse(x == 1, "Male", ifelse(x == 0, "Female", as.character(x)))
+}
+
+# Data preparation for director analysis
+director_data <- movie_data %>%
+  mutate(Director_gender = gender_to_initial(Director_gender)) %>%
+  group_by(Director_gender) %>%
+  summarise(
+    count = n(),  # Number of movies for each director gender
+    avg_revenue = mean(revenue, na.rm = TRUE),  # Average revenue per gender
+    avg_budget = mean(budget, na.rm = TRUE),  # Average budget per gender
+    avg_rev_bud_ratio = mean(rev_bud_ratio, na.rm = TRUE)  # Average revenue/budget ratio per gender
+  ) %>%
+  pivot_longer(cols = c(count, avg_revenue, avg_budget, avg_rev_bud_ratio),
+               names_to = "metric", values_to = "value")
+
+# Plotting metrics for director gender
+ggplot(director_data, aes(x = Director_gender, y = value, fill = metric)) +
+  geom_bar(stat = "identity", color = "black") +
+  facet_wrap(~ metric, scales = "free_y", nrow = 2, ncol = 2, 
+             labeller = labeller(metric = c(
+               "count" = "Number of movies",
+               "avg_revenue" = "Average Revenue",
+               "avg_budget" = "Average Budget",
+               "avg_rev_bud_ratio" = "Average Rev/Bud"
+             ))) +
+  theme_minimal() +
+  labs(
+    title = "Metrics for Director Gender",
+    x = "Director Gender",
+    y = ""
+  ) +
+  theme(
+    axis.text.x = element_text(hjust = 0.5),  # Center-align x-axis labels
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+    strip.background = element_rect(fill = "lightgray"),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"  # Remove legend
+  ) +
+  scale_x_discrete(limits = c("Male", "Female")) +
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  scale_fill_manual(values = c(
+    "avg_rev_bud_ratio" = "purple",  # Darker RdPu color
+    "avg_revenue" = "darkred",        # Darker Reds color
+    "avg_budget" = "darkblue",         # Darker YlGnBu color
+    "count" = "darkgreen"              # Darker YlGn color
+  ))
+
+# Cleaning up temporary data
+rm(gender_to_initial)
+rm(director_data)
+```
+
+We can note that the number of films made by female directors is significantly lower compared to those directed by male directors.
+Additionally, although less evident, female directors show lower values for all other metrics.
+
+Let’s now see which film genre is most produced by male directors and by female directors.
+
+```{r}
+# Function to convert numeric gender codes to initials
+gender_to_initial <- function(gender) {
+  ifelse(gender == 2, "M", ifelse(gender == 1, "F", NA))
+}
+
+# List of movie genres
+movie_genres <- c("Comedy", "Action", "Crime", "Thriller", "Adventure", 
+                  "Science_Fiction", "Animation", "Family", "Drama", 
+                  "Romance", "Mystery", "Fantasy", "War", "Music", 
+                  "Western", "History", "Horror", "Documentary", "TV_Movie")
+
+# Determine the most common genre for each director gender
+most_common_genre <- movie_data %>%
+  mutate(Director_gender = gender_to_initial(Director_gender)) %>%
+  select(Director_gender, all_of(movie_genres)) %>%
+  pivot_longer(cols = all_of(movie_genres), names_to = "movie_genre", values_to = "is_genre") %>%
+  filter(is_genre == 1) %>%
+  group_by(Director_gender, movie_genre) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(Director_gender) %>%
+  slice_max(order_by = count, n = 1)
+
+# Display the results in a readable format
+for(gender in c("M", "F")) {
+  genre <- most_common_genre %>% 
+    filter(Director_gender == gender) %>% 
+    pull(movie_genre)
+  
+  gender_label <- if(gender == "M") "male directors" else "female directors"
+  
+  cat(sprintf("The most common film genre for %s: %s\n", gender_label, genre))
+}
+
+rm(gender)
+rm(genre)
+rm(gender_label)
+rm(most_common_genre)
+```
+
+Below is the code to determine, based on the director’s gender, which film genre generates the highest revenue.
+
+```{r}
+# Calculate the genre with the highest revenue for each director gender
+highest_revenue <- movie_data %>%
+  mutate(Director_gender = gender_to_initial(Director_gender)) %>%
+  select(Director_gender, revenue, all_of(movie_genres)) %>%
+  pivot_longer(cols = all_of(movie_genres), names_to = "movie_genre", values_to = "is_genre") %>%
+  filter(is_genre == 1) %>%
+  group_by(Director_gender, movie_genre) %>%
+  summarise(avg_revenue = mean(revenue, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Director_gender) %>%
+  slice_max(order_by = avg_revenue, n = 1)
+
+# Display the results for the highest revenue genre
+for(gender in c("M", "F")) {
+  genre <- highest_revenue %>% 
+    filter(Director_gender == gender) %>% 
+    pull(movie_genre)
+  
+  gender_label <- if(gender == "M") "male directors" else "female directors"
+  
+  cat(sprintf("The film genre with the highest revenue for %s: %s\n", gender_label, genre))
+}
+
+rm(gender_to_initial)
+rm(highest_revenue)
+rm(movie_genres)
+rm(gender)
+rm(gender_label)
+rm(genre)
+```
+
+### Screenplay gender
+
+Let’s now examine the situation related to screenwriting, analyzing the differences between various genres.
+
+```{r}
+# Function to convert numeric values to gender initials for screenwriter analysis
+gender_to_initial <- function(x) {
+  ifelse(x == 2, "Male", ifelse(x == 1, "Female", as.character(x)))
+}
+
+# Data preparation for screenwriter analysis
+screenplay_data <- movie_data %>%
+  mutate(Screenplay_gender = gender_to_initial(Screenplay_gender)) %>%
+  group_by(Screenplay_gender) %>%
+  summarise(
+    count = n(),  # Number of movies for each screenwriter gender
+    avg_revenue = mean(revenue, na.rm = TRUE),  # Average revenue per gender
+    avg_budget = mean(budget, na.rm = TRUE),  # Average budget per gender
+    avg_rev_bud_ratio = mean(rev_bud_ratio, na.rm = TRUE)  # Average revenue/budget ratio per gender
+  ) %>%
+  pivot_longer(cols = c(count, avg_revenue, avg_budget, avg_rev_bud_ratio),
+               names_to = "metric", values_to = "value")
+
+# Custom function to format numbers with units
+format_number <- function(x) {
+  case_when(
+    x >= 1e9 ~ paste0(round(x / 1e9, 1), "B"),  # Format billions
+    x >= 1e6 ~ paste0(round(x / 1e6, 1), "M"),  # Format millions
+    x >= 1e3 ~ paste0(round(x / 1e3, 1), "K"),  # Format thousands
+    TRUE ~ as.character(round(x, 1))
+  )
+}
+
+# Plotting metrics for screenwriter gender
+ggplot(screenplay_data, aes(x = Screenplay_gender, y = value, fill = metric)) +
+  geom_bar(stat = "identity", color = "black") +
+  facet_wrap(~ metric, scales = "free_y", nrow = 2, ncol = 2, 
+             labeller = labeller(metric = c(
+               "count" = "Number of movies",
+               "avg_revenue" = "Average Revenue",
+               "avg_budget" = "Average Budget",
+               "avg_rev_bud_ratio" = "Average Rev/Bud"
+             ))) +
+  theme_minimal() +
+  labs(
+    title = "Metrics for Screenwriter Gender",
+    x = "Screenwriter Gender",
+    y = ""
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),  # Center-align x-axis labels
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+    panel.grid.minor.x = element_blank(),
+    strip.background = element_rect(fill = "lightgray"),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"  # Remove legend
+  ) +
+  scale_x_discrete(limits = c("Male", "Female")) +
+  scale_y_continuous(labels = format_number) +
+  scale_fill_manual(values = c(
+    "avg_rev_bud_ratio" = "purple",  
+    "avg_revenue" = "darkred",        
+    "avg_budget" = "darkblue",         
+    "count" = "darkgreen"               
+  ))
+
+# Cleaning up temporary data
+rm(screenplay_data)
+rm(format_number)
+rm(gender_to_initial)
+```
+
+Even in this case, we notice that films written by women are significantly fewer in number compared to those written by men.
+However, a particular trend emerges: the average revenue of films written by women is higher than that of films written by men.
+
+## Original Music
+
+### Mean
+
+Let’s move on to examine the percentage of films in our dataset that have an original composer, and therefore a main soundtrack, compared to those that use non-original music and songs.
+
+```{r}
+# Calculate the percentage of movies with original music
+mean_om = mean(movie_data$original_music, na.rm = TRUE)
+cat("The ", round(mean_om, 2) * 100, "% of movies has original music", sep = "")
+
+rm(mean_om)
+```
+
+We analyze the average revenue of films with original music compared to those without original music.
+
+```{r}
+# Calculate average revenue based on whether movies have original music
+revenue_by_music <- movie_data |> 
+  group_by(original_music) |> 
+  summarise(mean_revenue = mean(revenue, na.rm = TRUE)) |> 
+  mutate(music_status = ifelse(original_music == 1, 
+                                    "Original Music", 
+                                    "Not Original Music"))
+
+# Plotting average revenue for movies with or without original music
+ggplot(revenue_by_music, aes(x = music_status, y = mean_revenue, fill = music_status)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  labs(x = "Music Status", 
+       y = "Average Revenue", 
+       title = "Average revenue for movies with original music") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::dollar_format(scale = 1e-6, suffix = "M")) +
+  scale_fill_manual(values = c("Not Original Music" = "skyblue", 
+                               "Original Music" = "darkblue")) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, size = 13, face = "bold"),
+        axis.text.x = element_text(hjust = 0.5),
+        axis.title = element_text(size = 10))
+
+rm(revenue_by_music)
+```
+
+We notice that films with an original composer, on average, earn much more than those that do not have one.
+
+## CPI
+
+### vs Revenue and Year
+
+Finally, we have included an economic variable in our dataset, the CPI (Consumer Price Index), assuming that the economic situation of a country can influence the number of people going to the cinema, since cinema is not a necessary good.
+For this purpose, we graphically compare the CPI index with the revenue, to see if the trend of one over time is similar to the trend of the other.
+
+```{r}
+# Calculate the average revenue per year
+revenue_by_year <- movie_data %>%
+  group_by(year) %>%
+  summarise(mean_revenue = mean(revenue, na.rm = TRUE))
+
+# Calculate the average CPI per year (assuming there is only one CPI value per year)
+cpi_by_year <- movie_data %>%
+  group_by(year) %>%
+  summarise(mean_cpi = mean(average_cpi, na.rm = TRUE))
+
+# Combine the two datasets
+combined_data <- revenue_by_year %>%
+  full_join(cpi_by_year, by = "year") %>%
+  pivot_longer(cols = c(mean_revenue, mean_cpi),
+               names_to = "metric",
+               values_to = "value")
+
+# Create facet plots for the metrics
+ggplot(combined_data, aes(x = year, y = value)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ metric, ncol = 1, scales = "free_y", 
+             labeller = labeller(metric = c("mean_revenue" = "Average Revenue", 
+                                            "mean_cpi" = "CPI Index"))) +
+  labs(x = "Year", y = "") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(min(combined_data$year), 
+                                  max(combined_data$year), 
+                                  by = 10)) +
+  scale_y_continuous(labels = function(x) {
+    ifelse(x >= 1e6, paste0(x/1e6, "M"), x)
+  }) +
+  theme(strip.text = element_text(size = 12, face = "bold"))
+
+# Remove intermediate datasets from memory
+rm(combined_data)
+rm(cpi_by_year)
+rm(revenue_by_year)
+```
+
+We can observe that there is indeed a certain similarity in the trends of the CPI and the revenue.
+
+## Correlation Matrix
+
+Let’s conclude this descriptive analysis by showing the correlation matrix between the variables.
+We opted for a matrix that shows only those variables that are correlated with other variables with a correlation index of at least 0.30 in absolute value.
+
+```{r}
+# Select only the numeric variables from the dataset
+numeric_data <- movie_data |>  
+  select(where(is.numeric))
+
+# Compute the correlation matrix
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+
+# Identify rows with at least one correlation > 0.30 or < -0.30
+rows_to_keep <- apply(cor_matrix, 1, function(x) any(abs(x) > 0.30 & abs(x) < 1))
+
+# Filter the matrix to keep only these rows and columns
+cor_matrix_filtered <- cor_matrix[rows_to_keep, rows_to_keep]
+
+# Set correlations between -0.30 and 0.30 to NA for visualization purposes
+cor_matrix_filtered[abs(cor_matrix_filtered) <= 0.30] <- NA
+
+# Visualize the filtered correlation matrix
+corrplot(cor_matrix_filtered, method = "color", na.label = " ", tl.cex = 0.4, number.cex = 0.3, 
+         addCoef.col = "black", diag = FALSE, tl.col = "black")
+
+# Remove intermediate datasets from memory
+rm(numeric_data)
+rm(cor_matrix)
+rm(rows_to_keep)
+rm(cor_matrix_filtered)
+```
+
+Observing the matrix, a strong positive correlation is noted between a movie's budget and its revenue, suggesting that films with higher budgets tend to earn greater box office returns.
+This link is particularly evident, as indicated by the dark color of the corresponding cell.
+Another significant correlation is between popularity and the average rating received by movies in which the actors have participated, which makes sense since more popular films typically result in higher ratings.
+On the other hand, some negative correlations are observed, such as between the "Family" genre and the certification variable, suggesting that films of this genre indeed have a lower rating.
+Moreover, the correlation between variables like the number of words in the title and indicators of popularity or financial success appears to be relatively weak or non-existent, highlighting that the length of the title is not a determining factor for a film's success.
+
+# Statistical Test
+
+Regarding statistical tests, we will adopt a different approach.
+In this case, we will not proceed from the first to the last variable of the dataset, but we will divide the analysis based on the type of test performed.
+
+## T-test
+
+### IP
+
+```{r}
+# Perform the t-test for revenue based on IP (Intellectual Property)
+t_test_result <- t.test(revenue ~ IP, data = movie_data)
+
+# Display the t-test results
+t_test_result
+```
+
+The Welch's t-test performed on the revenue variable in relation to the Intellectual Property (IP) variable compares the average revenues between two groups: films not based on pre-existing intellectual properties (group 0) and those that are (group 1).
+The result shows a t-value of -5,2728., indicating a significant difference between the two groups.
+The associated p-value is extremely low (1.363e-07), well below the common significance threshold of 0.05.
+This suggests that the difference in average revenues between IP-based films and non-IP-based films is highly significant.
+
+The estimates of average revenues show that non-IP based films (group 0) have an average revenue of about \$61 million, while IP-based films (group 1) have a higher average revenue, approximately \$80 million.
+The difference between these two groups is further highlighted by the 95% confidence interval, which ranges from approximately -\$26 million to -\$12 million.
+Since the confidence interval does not include zero, it confirms that there is a significant difference in average revenues between the two groups.
+
+The image below shows a box plot comparing the revenue distribution between original films and films based on existing intellectual property (IP).
+
+```{r}
+# Plot the revenue comparison between original and IP-based movies
+ggplot(movie_data, aes(x = factor(IP), y = revenue)) +
+  geom_boxplot() +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    x = "IP", 
+    y = "Revenue (log scale)",
+    title = "Revenue Comparison Between Original and IP-Based Movies"
+  ) +
+  scale_x_discrete(labels = c("0" = "Original", "1" = "IP-Based")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+The provided boxplot shows the distribution of movie revenues divided into two groups: Original, representing films not based on pre-existing intellectual properties, and IP-Based, representing films based on existing IPs such as franchises, sequels, or adaptations of well-known works.
+The y-axis is presented in a logarithmic scale, which helps to better visualize the distribution of the data, especially when the revenues vary over a wide range.
+From the visualization of the boxplot, it is evident that IP-Based films tend to have higher average revenues compared to Original films.
+This is indicated by the position of the median line (which represents the median revenue value) being higher in the boxplot for IP-Based films.
+Additionally, the box itself, which contains 50% of the data (between the first and third quartiles), is slightly higher for IP-Based films, suggesting that the central distribution of revenues for these films is also higher.
+Another interesting aspect of the chart is the presence of numerous outliers (points outside the "whiskers" of the boxplot), especially for the Original films.
+These outliers indicate that there are original films that have generated particularly low revenues, much lower than most of the films in the dataset.
+
+### Original Music
+
+```{r}
+# Perform the t-test for revenue based on original music presence
+t_test_result <- t.test(revenue ~ original_music, data = movie_data)
+
+# Calculate the effect size (Cohen's d)
+cohens_d <- effsize::cohen.d(revenue ~ original_music, data = movie_data)
+
+# Visualization of revenue distribution based on the presence of original music
+ggplot(movie_data, aes(x = factor(original_music), y = revenue)) +
+  geom_boxplot() +
+  scale_y_log10(labels = scales::comma) +
+  labs(title = "Revenue Distribution for Presence of Original Music",
+       x = "Original Music (0 = No; 1 = Yes)", 
+       y = "Revenue (log scale)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+The boxplot displayed highlights the distribution of movie revenues based on the presence or absence of original music.
+The original_music variable is coded as 0 for films that do not have original music and 1 for those that do.
+The y-axis, as in the previous case, is represented in a logarithmic scale to handle the wide range of revenues present in the data.
+From the visual analysis of the boxplot, we notice that films with original music (indicated by 1) tend to have slightly higher revenues compared to those without original music (indicated by 0).
+However, the difference does not seem to be particularly pronounced: the medians of both groups are close, indicating that the typical revenue is similar between the two groups.
+The boxes, which represent the interquartile range (central 50% of the data), have a similar height, suggesting that the variability of revenues within each group is comparable.
+There are, however, some more noticeable outliers in the group without original music, indicating that there are films without original music that have had particularly low revenues, much lower compared to most other films.
+Despite this, the overall distribution seems to indicate that the presence of original music might have a positive effect on revenues, even if it is not a marked difference.
+
+```{r}
+# Generate descriptive statistics
+summary_stats <- movie_data |> 
+  group_by(original_music) |> 
+  summarise(
+    mean_revenue = mean(revenue, na.rm = TRUE),
+    median_revenue = median(revenue, na.rm = TRUE),
+    sd_revenue = sd(revenue, na.rm = TRUE),
+    n = n()
+  )
+
+# Print the t-test results
+print("T-test Result:")
+t_test_result
+
+# Print the effect size (Cohen's d)
+print("Effect Size (Cohen's d):")
+cohens_d
+
+# Remove intermediate datasets from memory
+rm(summary_stats)
+rm(t_test_result)
+rm(cohens_d)
+```
+
+The results of the Welch's t-test and the effect size measure (Cohen's d) indicate that there is a statistically significant difference in average revenues between films with and without original music.
+The t-test produced an extremely high t-value (-24.684) and a p-value less than 2.2e-16, confirming that the difference in average revenues between the two groups is not due to chance.
+Films with original music (group 1) have a significantly higher average revenue, approximately \$78.4 million, compared to films without original music (group 0), which have an average revenue of about \$19.4 million.
+The 95% confidence interval for the difference between the means does not include zero, further strengthening the significance of the difference.
+However, a Cohen's d of -0.40 indicates that, although the difference is statistically significant, the magnitude of the effect is small.
+This suggests that while the presence of original music is associated with higher revenues, the effect of this variable on revenues is not very large in terms of standard deviation units.
+Thus, original music can contribute to a film's financial success, but it might not be a principal determining factor.
+
+## ANOVA
+
+### Certification
+
+```{r}
+# ANOVA for revenue based on certification
+revenue_anova <- movie_data %>% 
+  mutate(certification = as.factor(certification)) %>% 
+  {aov(revenue ~ certification, data = .)}
+
+# Summary of the ANOVA results for revenue
+summary(revenue_anova)
+```
+
+The analysis of variance (ANOVA) conducted on the dataset assessed whether there are significant differences in the average revenues of films based on the film's certification (a categorical variable with various classifications, such as "G", "PG", "PG-13", "R").
+The ANOVA output shows that the certification variable has a significant effect on revenues, as indicated by the high F-value (138.8) and the extremely low p-value (less than 2e-16).
+This p-value suggests that the probability that the observed differences in revenues across different certifications are due to chance is virtually nil.
+The Sum Sq value for certification reflects the amount of variability in revenues that can be explained by certification, while the Mean Sq is the average variance associated with this variable.
+The presence of high statistical significance suggests that there are substantial differences in average revenues among at least some of the certifications considered.
+This implies that the film certification might be an important factor to consider in the financial performance of movies, potentially influencing audience reach and revenue generation.
+
+```{r}
+# Post-hoc analysis (Tukey HSD) for revenue
+TukeyHSD(revenue_anova)
+
+# Remove the ANOVA object from memory
+rm(revenue_anova)
+```
+
+The post-ANOVA analysis you've described involves a Tukey's Honestly Significant Difference (HSD) test or a similar method to compare the means of revenues among different certification groups.
+This type of test is commonly used after an ANOVA to conduct pairwise comparisons between groups to identify which specific certification groups significantly differ from each other in terms of revenues.
+The output provides a series of comparisons between certifications (numbered from 1 to 6), showing the average revenue difference (diff), the 95% confidence interval for that difference (lwr and upr), and the adjusted p-value (p adj) for each comparison.
+Significant differences in average revenues, as indicated by very low p-values in comparisons like 3-1, 4-1, 5-1, and 6-1, suggest that films with these certifications have significantly different revenues compared to group 1.
+For instance, the difference between groups 6 and 1 has a confidence interval that does not include zero and an extremely low p-value, indicating a highly significant difference.
+Further, comparisons such as 6-4 and 6-3 show significant differences between certifications 6 and 4, and 6 and 3, respectively, suggesting that there are also relevant differences in average revenues between these groups.
+This detailed breakdown can help stakeholders understand how certification influences movie earnings and can guide decisions in production and marketing to optimize financial outcomes based on the target audience’s certification preferences.
+
+### Month
+
+```{r}
+# ANOVA for revenue based on the month of release
+month_revenue_anova <- movie_data %>%
+  mutate(month = as.factor(month)) %>%
+  aov(revenue ~ month, data = .)
+
+# Summary of the ANOVA results
+summary(month_revenue_anova)
+```
+
+The analysis of variance (ANOVA) conducted on the revenues based on the release month of the films suggests that there are significant differences in average revenues depending on the month in which a film is released.
+The F-value of 23.89 and the p-value less than 2e-16 indicate that the probability that these differences are due to chance is virtually nil.
+This result implies that the release month is a relevant factor for a film's revenues.
+The Sum Sq value for the month (5.658e+18) represents the variability in revenues that can be explained by the month variable, while the Mean Sq indicates the average variance associated with the release months.
+The fact that the p-value is extremely low and the significance code confirm that the differences between the months are highly significant.
+
+Although ANOVA tells us that there are significant differences, it does not tell us which specific months differ from each other.
+For this, it would be necessary to examine the results of Tukey’s post-hoc test.
+
+```{r}
+# Levene's test for homogeneity of variances
+leveneTest(revenue ~ month, data = movie_data)
+```
+
+The Levene's test is used to assess the homogeneity of variances, that is, whether the variances of revenues across different film release months are equal.
+The output of the Levene's test indicates that the F-value is 23.109 and the associated p-value is less than 2.2e-16, which is extremely low.
+This very low p-value suggests that there is a significant difference in the variances of revenues across different months.
+In other words, the test rejects the null hypothesis of equal variances, indicating that the variance in revenues is not consistent across the release months.
+This is an important result because ANOVA assumes homogeneity of variances, and a violation of this assumption can affect the reliability of the ANOVA results.
+
+```{r}
+# Effect size (eta squared) calculation
+eta_squared(month_revenue_anova)
+```
+
+The eta squared (η²) is a measure of effect size that indicates the proportion of total variability explained by a particular independent variable in the context of an ANOVA.
+In this case, eta squared is calculated to assess the effect of the release month on movie revenues.
+The output shows that the eta squared for the variable "month" is 0.03, with a 95% confidence interval ranging from 0.02 to 1.00.
+This value of 0.03 means that 3% of the total variability in movie revenues can be attributed to the release month.
+Although this effect is statistically significant (as shown by the ANOVA), the magnitude of the effect is relatively small.
+In other words, while the release month does affect revenues, this variable explains only a small portion of the total variability.
+The confidence interval, which ranges from 0.02 to 1.00, suggests some uncertainty in the estimate, but the upper value of the interval (1.00) is artificially limited since eta squared cannot exceed 1.0.
+This indicates that, although there is an effect of the release month, its relevance in terms of explaining the variability in revenues is limited.
+
+```{r}
+# Post-hoc analysis (Tukey HSD) for the month-based ANOVA
+tukey_results <- TukeyHSD(month_revenue_anova)
+
+# Plot the revenue distribution by month of release
+ggplot(movie_data, aes(x = factor(month), y = revenue)) +
+  geom_boxplot() +
+  scale_y_log10(labels = scales::label_number(scale = 1e-6, suffix = "M")) +
+  scale_x_discrete(labels = c("01" = "January", "02" = "February", "03" = "March", 
+                              "04" = "April", "05" = "May", "06" = "June",
+                              "07" = "July", "08" = "August", "09" = "September", 
+                              "10" = "October", "11" = "November", "12" = "December")) +
+  labs(title = "Revenue Distribution by Month of Release",
+       x = "Month", y = "Revenue (log scale)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 10))
+
+# Remove the month-based ANOVA and Tukey results from memory
+rm(month_revenue_anova)
+rm(tukey_results)
+```
+
+The boxplot shows the distribution of movie revenues based on the release month, with the y-axis in logarithmic scale to handle the wide range of revenues.
+Each box represents the revenue distribution for films released in a particular month, providing information on values such as the median, the interquartile range, and outliers.
+From the chart, it is noticeable that, although there are some variations between months, the median revenue remains fairly similar for most months.
+However, some months, like July and December, show a tendency towards higher average revenues compared to other months, likely due to the summer season and holiday periods, which are famously profitable times for movie releases.
+Outliers are present in all months, indicating that there are films which, regardless of the release month, have achieved significantly lower or higher revenues compared to most of the films released in the same period.
+The presence of these outliers suggests that, apart from the release month, there are other relevant factors influencing movie revenues, such as budget, promotion, cast, and competition.
+
+## Wilcoxon-Mann-Whitney Test
+
+### Cast Gender
+
+```{r}
+# Filter the data to remove any NAs and select relevant columns
+data_filtered <- movie_data %>%
+  filter(!is.na(rev_bud_ratio) & !is.na(Star_gender1) & !is.na(Star_gender2)) %>%
+  select(rev_bud_ratio, Star_gender1, Star_gender2)
+
+# Create a new variable to distinguish between movies with male and female stars
+data_filtered <- data_filtered %>%
+  mutate(gender_category = case_when(
+    Star_gender1 == 1 & Star_gender2 == 1 ~ "Both Male",
+    Star_gender1 == 0 & Star_gender2 == 0 ~ "Both Female",
+    TRUE ~ "Mixed"
+  ))
+
+# Perform the Wilcoxon-Mann-Whitney test between movies with "Both Male" and "Both Female" stars
+wilcox_test <- wilcox.test(rev_bud_ratio ~ gender_category, 
+                           data = data_filtered %>% 
+                           filter(gender_category %in% c("Both Male", "Both Female")))
+
+# Display the Wilcoxon test results
+wilcox_test
+
+# Remove the filtered data and test results from memory
+rm(data_filtered)
+rm(wilcox_test)
+```
+
+The Wilcoxon-Mann-Whitney test, conducted on the revenue-to-budget ratio (rev_bud_ratio) in relation to the gender of the two main stars of the film, aims to determine if there is a significant difference in the distribution of this ratio between films with both male protagonists ("Both Male") and those with both female protagonists ("Both Female").
+The output of the test shows a W value of 1,061,904 and a p-value of 0.4596.
+Since the p-value is above the common significance threshold, there is not enough statistical evidence to reject the null hypothesis.
+The null hypothesis in this context is that there is no significant difference in the distribution of the revenue-to-budget ratio between the two groups of films.
+In other words, the results of the test indicate that there is no statistically significant difference in the revenue-to-budget ratio between films with male protagonists and those with female protagonists.
+This suggests that, at least based on this sample and this analysis, the gender of the two main stars does not significantly influence the economic effectiveness of a film in terms of its revenue-to-budget ratio.
+
+# Final Dataset
+
+Since we have to many *screenwriters* without a gender, we are going to remove the columns related to this role.
+
+```{r}
+movie_data <- movie_data |> 
+  select(-c(Screenplay_rev, 
+            Screenplay_gender,
+            Screenplay_pop,
+            Screenplay_vote))
+```
+
+Finally, we remove the `rev_bud_ratio` variable from our dataset.
+
+```{r}
+movie_data <- movie_data |> 
+  select(-rev_bud_ratio)
+```
+
+At this point, we can proceed to save the new dataset, which we will use for future analyses.
+
+```{r}
+# Save the final dataset to an Excel file
+write.xlsx(movie_data, "final_dataset.xlsx", rowNames = FALSE)
+```
+
+# Prediction Models
+
+We will now develop various models to make predictions on our dataset. Our goal is to determine whether a movie will be able to gross at least three times its budget. We have set this threshold based on the unofficial "rule of x3" in the film industry. According to this rule, a movie must cover not only production costs, which can include expenses for sets or actors' fees, but also additional charges such as marketing expenses, incurred after the film is made. Moreover, a movie's earnings are not entirely allocated to the producers but must be shared with other stakeholders, such as cinema owners or distributors. For these reasons, a movie can be considered profitable if its revenues exceed about three times the production budget.
+
+For our analysis, we will use several models, including Ridge and LASSO, Random Forest, and Extreme Gradient Boosting. First, we will import our dataset, previously prepared in the file "3. EDA.Rmd". Next, we will implement some Feature Engineering techniques to enrich the dataset with new variables that could enhance the accuracy of the analysis.
+
+We will then proceed to balance the dataset using the oversampling technique, as the classes are uneven: about 68% of our observations are classified as "unprofitable," with a revenue-to-budget ratio of less than 3, while only 32% are considered "profitable." Such an imbalance can cause significant distortions in the analysis.
+
+After balancing the dataset, we will apply the various algorithms and evaluate their performance, subsequently comparing the results of each model.
+
+The following code will perform these operations, starting with the Ridge and LASSO models.
+
+```{r}
+# Loading necessary libraries for data manipulation, statistical modeling, and visualization
+library(glmnet)       # For ridge and LASSO regression
+library(readxl)       # For reading Excel files
+library(caret)        # For creating confusion matrices and other model training tasks
+library(tidyverse)    # For data manipulation and visualization
+library(dplyr)        # For data manipulation
+library(ROSE)         # For handling imbalanced data through oversampling
+
+# Loading the dataset from an Excel file
+final_dataset <- read_excel("final_dataset.xlsx")
+
+# Log transforming budget and revenue, creating new variables for analysis
+final_dataset <- final_dataset %>% 
+  mutate(
+    log_budget = log1p(budget),  # Applying log(1+x) transformation to budget
+    Star1_rev_log = log(Star1_rev + 1),  # Log transforming revenue of star 1
+    Star2_rev_log = log(Star2_rev + 1),  # Log transforming revenue of star 2
+    Director_rev_log = log(Director_rev + 1),  # Log transforming director's revenue
+    budget_per_minute = budget / runtime,  # Calculating budget per minute of runtime
+    Star_popularity = Star1_pop + Star2_pop,  # Summing popularity of two stars
+    star_power = Star1_rev + Star2_rev + Director_rev,  # Calculating combined star power
+    cast_crew_popularity = Star1_pop + Star2_pop + Director_pop,  # Sum of popularity of cast and crew
+    star_vote = (Star1_vote + Star2_vote + Director_vote) / 3,  # Average votes of stars
+    gender_disparity = abs(Star_gender1 - Star_gender2),  # Absolute difference in gender representation
+    star_budget_power = star_power * log_budget,  # Interaction term between star power and budget
+    ip_collection = IP * belongs_to_collection,  # Interaction between intellectual property and collection membership
+    potential_profit = (log_budget / runtime) * average_cpi,  # Calculated potential profit
+    popularity_budget_interaction = Star_popularity * budget / runtime,  # Interaction between star popularity and budget per runtime
+    star_power_ip_interaction = (Star1_rev + Star2_rev + Director_rev) * IP,  # Interaction between star power and IP
+    Star_popularity_budget = Star_popularity * budget,  # Interaction between star popularity and budget
+    Star_popularity_runtime = Star_popularity * runtime,  # Interaction between star popularity and runtime
+    Star_popularity_IP = Star_popularity * IP,  # Interaction between star popularity and IP
+    budget_runtime = budget * runtime,  # Product of budget and runtime
+    budget_IP = budget * IP,  # Product of budget and IP
+    runtime_IP = runtime * IP  # Product of runtime and IP
+  ) %>%
+  mutate(across(c(Star_popularity, budget, runtime, IP), ~ .^2, .names = "{.col}_squared")) |>  # Squaring selected columns for nonlinear effects
+  mutate(worth = ifelse(revenue / budget >= 3, 1, 0)) |>  # Creating binary outcome variable for high profit
+  select(-title)  # Removing the title column from the dataset
+
+# Setting seed for reproducibility in random operations
+set.seed(123)
+
+# Creating folds for cross-validation with k=5
+folds <- createFolds(final_dataset$revenue, k = 5)
+final_dataset$month_encoded <- NA
+for(i in 1:5) {
+  fold_train <- final_dataset[-folds[[i]], ]
+  fold_valid <- final_dataset[folds[[i]], ]
+  month_mean <- fold_train %>%
+    group_by(month) %>%
+    summarise(month_target_mean = mean(revenue))
+  fold_valid <- fold_valid %>%
+    left_join(month_mean, by = "month") %>%
+    mutate(month_encoded = month_target_mean)
+  final_dataset[folds[[i]], "month_encoded"] <- fold_valid$month_encoded
+}
+final_dataset <- final_dataset %>% 
+  select(-c(month, revenue))
+
+# Oversampling using ROSE's ovun.sample method on the whole dataset to address class imbalance
+balanced_data <- ovun.sample(worth ~ ., data = final_dataset, method = "over", N = 2 * sum(final_dataset$worth == 0))$data
+
+# Splitting the balanced dataset into training (80%) and testing (20%) sets
+train_size <- floor(0.8 * nrow(balanced_data))
+train_indices <- sample(seq_len(nrow(balanced_data)), size = train_size)
+
+train <- balanced_data[train_indices, ]
+test <- balanced_data[-train_indices, ]
+
+# Creating input matrices and target vectors for modeling
+x_train = as.matrix(train %>% select(-worth))
+y_train = train$worth
+
+x_test = as.matrix(test %>% select(-worth))
+y_test = test$worth
+
+# Training Ridge and LASSO regression models using cross-validation to select the best lambda
+ridge_mod = cv.glmnet(x_train, y_train, alpha = 0, family = "binomial")
+best_lambda_ridge = ridge_mod$lambda.min
+lasso_mod = cv.glmnet(x_train, y_train, alpha = 1, family = "binomial")
+best_lambda_lasso = lasso_mod$lambda.min
+
+# Making predictions on test data using the selected best lambda values
+ridge_pred = predict(ridge_mod, s = best_lambda_ridge, newx = x_test, type = "response")
+lasso_pred = predict(lasso_mod, s = best_lambda_lasso, newx = x_test, type = "response")
+
+# Converting predictions to binary outcomes (0 or 1) using a threshold of 0.5
+ridge_pred_binary = ifelse(ridge_pred >= 0.5, 1, 0)
+lasso_pred_binary = ifelse(lasso_pred >= 0.5, 1, 0)
+
+# Function to calculate and print model metrics without Recall
+calculate_and_print_metrics <- function(pred, actual, model_name) {
+  confusion_matrix = confusionMatrix(factor(pred), factor(actual))
+
+  print(paste(model_name, "Model Metrics:"))
+  print("Confusion Matrix:")
+  print(confusion_matrix$table)
+
+  accuracy = confusion_matrix$overall['Accuracy']
+  precision = confusion_matrix$byClass['Pos Pred Value']
+  sensitivity = confusion_matrix$byClass['Sensitivity']
+  f1_score = confusion_matrix$byClass['F1']
+  specificity = confusion_matrix$byClass['Specificity']
+
+  print(paste("Accuracy:", round(accuracy, 4)))
+  print(paste("Precision:", round(precision, 4)))
+  print(paste("F1 Score:", round(f1_score, 4)))
+  print(paste("Sensitivity:", round(sensitivity, 4)))
+  print(paste("Specificity:", round(specificity, 4)))
+
+  cat("\n")  # Adding a blank line for better readability
+}
+
+# Calculate and print metrics for the Ridge model
+calculate_and_print_metrics(ridge_pred_binary, y_test, "Ridge")
+
+# Calculate and print metrics for the LASSO model
+calculate_and_print_metrics(lasso_pred_binary, y_test, "LASSO")
+```
+
+In analyzing the results obtained from the Ridge and LASSO models, a picture of very similar performances emerges, with some subtle differences that warrant careful consideration. The Ridge model shows a slightly higher accuracy (68.46%) compared to the LASSO model (68.33%). Although minimal, this difference suggests that Ridge might have a marginally better capacity to correctly classify instances in the overall dataset. Looking at precision, we notice a substantial equivalence between the two models, with Ridge achieving 66.69% and LASSO 66.67%. This indicates that when the models predict a positive outcome, the probability that it is indeed positive is nearly identical for both. The F1 score, which provides a balanced synthesis of precision and sensitivity, is slightly higher for the Ridge model (69.02%) compared to LASSO (68.81%). This suggests that Ridge might offer a better balance between these two important metrics. Regarding sensitivity, the Ridge model (71.51%) slightly surpasses LASSO (71.09%). This implies that Ridge is a bit more effective at correctly identifying positive cases, showing a greater ability to capture true positives in the dataset. Finally, in terms of specificity, contrary to what the general trend might suggest, the LASSO model (65.67%) shows a slight advantage over Ridge (65.50%). Although minimal, this difference indicates that LASSO is marginally more precise in correctly identifying negative cases.
+
+Let's proceed with the Random Forest model.
+
+```{r}
+library(randomForest)   # For random forest modeling
+
+# Loading and preparing the data
+final_dataset <- read_excel("final_dataset.xlsx")  
+
+# Log transformation of budget and revenue, and creation of new variables for modeling
+final_dataset <- final_dataset %>% 
+  mutate(
+    log_budget = log1p(budget),  
+    Star1_rev_log = log(Star1_rev + 1),  
+    Star2_rev_log = log(Star2_rev + 1),  
+    Director_rev_log = log(Director_rev + 1),  
+    budget_per_minute = budget / runtime,  
+    Star_popularity = Star1_pop + Star2_pop,  
+    star_power = Star1_rev + Star2_rev + Director_rev,  
+    cast_crew_popularity = Star1_pop + Star2_pop + Director_pop,  
+    star_vote = (Star1_vote + Star2_vote + Director_vote) / 3,  
+    gender_disparity = abs(Star_gender1 - Star_gender2),  
+    star_budget_power = star_power * log_budget,  
+    ip_collection = IP * belongs_to_collection,  
+    potential_profit = (log_budget / runtime) * average_cpi,  
+    popularity_budget_interaction = Star_popularity * budget / runtime,  
+    star_power_ip_interaction = (Star1_rev + Star2_rev + Director_rev) * IP,  
+    Star_popularity_budget = Star_popularity * budget,  
+    Star_popularity_runtime = Star_popularity * runtime,  
+    Star_popularity_IP = Star_popularity * IP,  
+    budget_runtime = budget * runtime,  
+    budget_IP = budget * IP,  
+    runtime_IP = runtime * IP  
+  ) %>%
+  mutate(across(c(Star_popularity, budget, runtime, IP), ~ .^2, .names = "{.col}_squared")) |>  
+  mutate(worth = ifelse(revenue / budget >= 3, 1, 0)) |>  
+  select(-title)  
+
+# Encoding the 'month' variable with the mean revenue of the respective month from cross-validation folds
+set.seed(123)  
+folds <- createFolds(final_dataset$revenue, k = 5)  
+final_dataset$month_encoded <- NA
+for(i in 1:5) {
+  fold_train <- final_dataset[-folds[[i]], ]
+  fold_valid <- final_dataset[folds[[i]], ]
+  month_mean <- fold_train %>%
+    group_by(month) %>%
+    summarise(month_target_mean = mean(revenue))  
+  fold_valid <- fold_valid %>%
+    left_join(month_mean, by = "month") %>%
+    mutate(month_encoded = month_target_mean)  
+  final_dataset[folds[[i]], "month_encoded"] <- fold_valid$month_encoded
+}
+final_dataset <- final_dataset %>% 
+  select(-c(month, revenue))  
+
+
+final_dataset$worth <- factor(final_dataset$worth)
+
+
+balanced_data <- ovun.sample(worth ~ ., data = final_dataset, method = "over", N = 2 * sum(final_dataset$worth == 0))$data
+
+# Checking the new class distribution
+print(prop.table(table(balanced_data$worth)))  
+
+# Splitting the data into training and testing sets with 75% of data used for training
+train_indices <- createDataPartition(balanced_data$worth, p = 0.75, list = FALSE)
+train <- balanced_data[train_indices, ]
+test <- balanced_data[-train_indices, ]
+
+# Optimizing the mtry parameter for the random forest model
+tuned_rf <- tuneRF(
+  x = train[, -which(names(train) %in% c("worth", "revenue", "log_revenue"))],  # Features for tuning
+  y = train$worth,  # Target variable
+  ntreeTry = 500,  # Number of trees to try
+  stepFactor = 1.5,  # Step factor for tuning
+  improve = 0.01,  # Improvement threshold
+  trace = TRUE,  # Print updates during tuning
+  plot = FALSE  # Do not plot tuning process
+)
+
+# Extracting the best mtry value
+best_mtry <- tuned_rf[which.min(tuned_rf[, 2]), 1]
+
+# Training the final random forest model with the optimized mtry
+model <- randomForest(
+  worth ~ ., 
+  data = train, 
+  importance = TRUE, 
+  ntree = 1000,
+  mtry = best_mtry
+)
+
+# Evaluating the model using the test data
+predictions <- predict(model, newdata = test)
+conf_matrix <- confusionMatrix(predictions, test$worth)
+
+# Displaying the confusion matrix
+print("Confusion Matrix:")
+print(conf_matrix$table)
+
+# Calculating and displaying evaluation metrics
+accuracy <- conf_matrix$overall["Accuracy"]
+precision <- conf_matrix$byClass["Precision"]
+f1_score <- conf_matrix$byClass["F1"]
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+specificity <- conf_matrix$byClass["Specificity"]
+
+# Printing the metrics
+print(paste("Accuracy:", round(accuracy, 4)))
+print(paste("Precision:", round(precision, 4)))
+print(paste("F1 Score:", round(f1_score, 4)))
+print(paste("Sensitivity:", round(sensitivity, 4)))
+print(paste("Specificity:", round(specificity, 4)))
+```
+
+The analysis of the Random Forest model reveals significantly better performance compared to the previously examined Ridge and LASSO models. The optimization process for the mtry parameter identified an optimal value of 12, which produced the lowest Out-of-Bag (OOB) error of 13.23%. This result suggests good model calibration, effectively balancing complexity and generalization. The performance metrics of the model are very good, with an accuracy of 87.61%, indicating that the model correctly classifies nearly 90% of the instances. The precision is high and well-balanced at 89.35%. An F1 score of 0.8733 confirms the balance between precision and sensitivity. A specificity of 89.82% indicates a strong capability of the model to correctly identify negative cases, while the sensitivity is at 85.39%.
+
+We then conclude with the XGBoost model. 
+
+```{r}
+# Loading necessary libraries
+library(xgboost)   # For using the XGBoost machine learning algorithm
+library(Matrix)    # For handling sparse and dense matrix types which are often required by xgboost
+
+# Loading and preparing the data
+final_dataset <- read_excel("final_dataset.xlsx")  
+
+# Logarithmic transformation of budget and revenue and creation of new variables
+final_dataset <- final_dataset %>% 
+  mutate(
+    log_budget = log1p(budget),  
+    Star1_rev_log = log(Star1_rev + 1), 
+    Star2_rev_log = log(Star2_rev + 1),  
+    Director_rev_log = log(Director_rev + 1),  
+    budget_per_minute = budget / runtime,  
+    Star_popularity = Star1_pop + Star2_pop,  
+    star_power = Star1_rev + Star2_rev + Director_rev,  
+    cast_crew_popularity = Star1_pop + Star2_pop + Director_pop,  
+    star_vote = (Star1_vote + Star2_vote + Director_vote) / 3,  
+    gender_disparity = abs(Star_gender1 - Star_gender2),  
+    star_budget_power = star_power * log_budget,  
+    ip_collection = IP * belongs_to_collection,  
+    potential_profit = (log_budget / runtime) * average_cpi,  
+    popularity_budget_interaction = Star_popularity * budget / runtime,  
+    star_power_ip_interaction = (Star1_rev + Star2_rev + Director_rev) * IP,  
+    Star_popularity_budget = Star_popularity * budget,  
+    Star_popularity_runtime = Star_popularity * runtime,  
+    Star_popularity_IP = Star_popularity * IP,  
+    budget_runtime = budget * runtime,  
+    budget_IP = budget * IP,  
+    runtime_IP = runtime * IP  
+  ) %>%
+  mutate(across(c(Star_popularity, budget, runtime, IP), ~ .^2, .names = "{.col}_squared")) |>  
+  mutate(worth = ifelse(revenue / budget >= 3, 1, 0)) |>  
+  select(-title)  
+
+# Encoding the 'month' variable using mean revenue of each month from cross-validation folds
+set.seed(123)  
+folds <- createFolds(final_dataset$revenue, k = 5)  
+final_dataset$month_encoded <- NA  
+for(i in 1:5) {
+  fold_train <- final_dataset[-folds[[i]], ]
+  fold_valid <- final_dataset[folds[[i]], ]
+  month_mean <- fold_train %>%
+    group_by(month) %>%
+    summarise(month_target_mean = mean(revenue))  
+  fold_valid <- fold_valid %>%
+    left_join(month_mean, by = "month") %>%
+    mutate(month_encoded = month_target_mean)  
+  final_dataset[folds[[i]], "month_encoded"] <- fold_valid$month_encoded
+}
+final_dataset <- final_dataset %>% 
+  select(-c(month, revenue))  
+
+# Converting 'worth' to a factor for classification
+final_dataset$worth <- as.factor(final_dataset$worth)
+
+# Applying undersampling to balance the dataset
+balanced_data <- ovun.sample(worth ~ ., data = final_dataset, method = "over", N = 2 * sum(final_dataset$worth == 0))$data
+
+# Checking the new class distribution
+print(prop.table(table(balanced_data$worth)))  
+
+# Splitting data into training and testing sets (75% training, 25% testing)
+train_indices <- createDataPartition(balanced_data$worth, p = 0.75, list = FALSE)
+train <- balanced_data[train_indices, ]
+test <- balanced_data[-train_indices, ]
+
+# Preparing data for XGBoost
+train_x <- train %>% select(-worth)  # Feature matrix for training
+train_y <- as.numeric(train$worth) - 1  # Numeric conversion of target variable for training
+test_x <- test %>% select(-worth)  # Feature matrix for testing
+test_y <- as.numeric(test$worth) - 1  # Numeric conversion of target variable for testing
+
+# Function to convert factors to numeric values
+factor_to_numeric <- function(x) {
+  if(is.factor(x)) as.numeric(as.factor(x)) - 1
+  else x
+}
+
+# Applying the conversion to training and testing feature matrices
+train_x <- train_x %>% 
+  mutate_if(is.character, as.factor) %>%
+  mutate_all(factor_to_numeric)
+test_x <- test_x %>% 
+  mutate_if(is.character, as.factor) %>%
+  mutate_all(factor_to_numeric)
+
+# Creating DMatrix objects for XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(train_x), label = train_y)
+dtest <- xgb.DMatrix(data = as.matrix(test_x), label = test_y)
+
+# Defining XGBoost parameters
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.3,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+# Training the XGBoost model
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+# Making predictions
+predictions_prob <- predict(xgb_model, dtest)
+predictions <- as.factor(ifelse(predictions_prob > 0.5, 1, 0))
+
+# Creating and displaying the confusion matrix
+conf_matrix <- confusionMatrix(predictions, as.factor(test_y))
+print("Confusion Matrix:")
+print(conf_matrix$table)
+
+# Calculating and printing evaluation metrics
+accuracy <- conf_matrix$overall["Accuracy"]
+precision <- conf_matrix$byClass["Precision"]
+f1_score <- conf_matrix$byClass["F1"]
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+specificity <- conf_matrix$byClass["Specificity"]
+
+# Printing the evaluation metrics
+print(paste("Accuracy:", round(accuracy, 4)))
+print(paste("Precision:", round(precision, 4)))
+print(paste("F1 Score:", round(f1_score, 4)))
+print(paste("Sensitivity:", round(sensitivity, 4)))
+print(paste("Specificity:", round(specificity, 4)))
+```
+
+The performance analysis of the XGBoost model reveals solid results, although slightly inferior to the previously examined Random Forest model. With an accuracy of 83.77%, the XGBoost model demonstrates good overall classification ability, successfully predicting the "worth" of movies in more than four out of five cases. A precision of 86.6% indicates that when the model predicts a movie as "worth," it has a high success rate. An F1 score of 0.8312 suggests a good balance between precision and sensitivity, confirming the overall robustness of the model. The sensitivity (79.91%) and specificity (87.64%) are well-balanced, with a slight tendency towards the correct identification of negative cases. This might indicate the model's caution in classifying films as "worth," preferring to avoid false positives.

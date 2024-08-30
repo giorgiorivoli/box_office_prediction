@@ -1,0 +1,1146 @@
+---
+title: "2. Data Preparation"
+author: "Giorgio Rivoli"
+date: "2024-07-15"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+We now move on to the preparation of our dataset. We begin with the
+`collected_movies` dataset obtained through the TMDB API. The goal is to
+transform this dataset into a more refined version that will enable us
+to perform the necessary analyses.
+
+```{r}
+# Load required libraries
+library(readxl)       # For reading Excel files
+library(openxlsx)     # For writing Excel files
+library(dplyr)        # For data manipulation
+library(httr)         # For HTTP requests
+library(jsonlite)     # For working with JSON data
+library(tidyr)        # For data tidying
+library(stringr)      # For string manipulation
+library(tidyverse)    # Meta-package for data science
+library(tidytext)     # For text analysis
+library(textdata)     # For accessing textual datasets
+library(lubridate)    # For date-time manipulation
+library(scrapex)      # For web scraping
+library(rvest)        # For web scraping and parsing HTML
+library(ggplot2)      # For data visualization
+library(cowplot)      # For combining plots
+library(explore)      # For interactive data exploration
+library(patchwork)    # For combining multiple plots
+library(mice)         # For imputing missing values
+library(Amelia)       # For multiple imputation
+library(missForest)   # For imputing missing values using random forests
+```
+
+To begin, let’s import the dataset that includes all the movies.
+
+```{r}
+# Read the Excel file containing collected movie data
+collected_movies <- read_excel("collected_movies.xlsx")
+```
+
+This operation takes approximately 9 minutes.
+
+# Filtering Data
+
+Once completed, we will remove all movies with a `revenue` value of 0.
+This variable is crucial for our future predictive analysis, so movies
+with a revenue of 0 are not relevant to us.
+
+```{r}
+# Filter out movies with zero revenue
+movie_data <- collected_movies[collected_movies$revenue > 0, ]
+```
+
+The new dataset consists of significantly fewer observations, precisely
+**21,820**, which represent about 2% of the total number of films in the
+complete dataset. We can further reduce our dataset. For example, there
+are films with a release **year** of **2025**, but we are only
+interested in those that have already recorded revenue. Therefore, we
+exclude these films. To do this, we first need to manipulate the date,
+creating two new columns: **year** and **month**.
+
+```{r}
+# Remove rows with NA in the release_date column
+movie_data <- movie_data |> 
+  filter(!is.na(release_date))
+
+# Create year and month columns from release_date
+movie_data <- movie_data |> 
+  mutate(year = substr(release_date, 1, 4)) |> 
+  relocate(year, .after = release_date) |> 
+  mutate(month = substr(release_date, 6, 7)) |> 
+  relocate(month, .after = year)
+```
+
+Once this is done, we can proceed with the operation.
+
+An additional filter concerns the duration (**runtime**). Audiovisual
+content can be divided into three categories: *short films,
+medium-length films,* and *feature films*. There is no unanimous
+definition, but generally, a short film has a maximum duration of 20/30
+minutes, a medium-length film lasts between 20/30 and 60 minutes. Since
+we want to focus on feature films that are released in theaters, we will
+exclude from the dataset all films with a duration of less than **60
+minutes**. We also noticed two films with a duration of over **400
+minutes**. Upon further investigation, we discovered that they are not
+unique films, but episodes of a television series considered as a single
+film. These are also not of our interest and we will exclude them.
+
+Finally, we focus on the **budget** variable. Examining the dataset, we
+noticed some films with extremely low budgets, even as low as ten
+dollars. It is unlikely that a film can be produced, edited, and
+distributed with such a low budget. We chose a threshold of 6,000
+dollars, based on several attempts. Up to this threshold, the budgets
+seemed improbable to us. With a threshold of 7,000 dollars, we found the
+film *El Mariachi* by *Robert Rodriguez*, produced with a budget of
+7,000 dollars. Therefore, we set the threshold at **6,000** dollars.
+
+```{r}
+# Filter out other movies
+movie_data <- movie_data |> 
+  filter(!year == 2025) |> 
+  filter(!runtime < 60) |> 
+  filter(!runtime > 400) |> 
+  filter(!budget < 6000)
+```
+
+Next, we will remove all rows where **NA values** could cause issues.
+However, for some variables, we will not eliminate observations with NA
+values, as they will either be manipulated differently later or we will
+opt for imputation.
+
+```{r}
+# Remove rows with NA values in important columns
+movie_data <- movie_data |> 
+  filter(!is.na(overview)) |> 
+  filter(!is.na(original_language)) |> 
+  filter(!is.na(genres)) |> 
+  filter(!is.na(production_countries)) |> 
+  filter(!is.na(spoken_languages)) |> 
+  filter(!is.na(cast)) |> 
+  filter(!is.na(crew)) |> 
+  filter(!is.na(jobs)) |> 
+  filter(!is.na(cast_genders)) |> 
+  filter(!is.na(crew_genders))
+```
+
+Finally, we also remove rows that have potential duplicates for the
+`title` variable.
+
+```{r}
+# Remove duplicates based on the "title" column 
+movie_data <- movie_data |> 
+  distinct(title, .keep_all = TRUE)
+```
+
+As a result of these operations, our dataset includes just over 10,000
+films.
+
+# Data Manipulation
+
+We can now proceed with the manipulation of existing variables and, in
+many cases, create new variables starting from the initial ones. To make
+understanding easier, we will work from the first columns on the left
+towards the right.
+
+### Title
+
+With reference to the titles in our dataset, we have two variables:
+`original_title` and `title`. The first operation we will perform on
+these variables is the creation of two new columns, which will contain
+the **word count** of the original title and the translated title,
+respectively.
+
+```{r}
+# Add columns for word count in title and original title
+movie_data <- movie_data |> 
+  mutate(nmb_wrd_title = sapply(strsplit(as.character(title), " "), length)) |> 
+  mutate(nmb_wrd_orgnl = sapply(strsplit(as.character(original_title), " "), length)) |> 
+  select(id, original_title, nmb_wrd_orgnl, title, nmb_wrd_title, everything())
+```
+
+Subsequently, we will proceed with **sentiment analysis** on the title
+variable. For this operation, we will use the **AFINN lexicon**, a
+regression approach that assigns scores to words ranging from -3 to 3.
+The result of this manipulation will be a new column that, starting from
+the title in English (i.e., the `title` column), will return a numerical
+value derived from the sum of the sentiments of all the words that make
+up the title. Naturally, the lower the score, the more the title will be
+associated with negative sentiments, and vice versa.
+
+```{r}
+# Load the Afinn sentiment lexicon
+afinn <- get_sentiments("afinn")
+
+# Calculate sentiment score for each title
+titles_sentiment <- movie_data |> 
+  unnest_tokens(word, title) |> 
+  inner_join(afinn, by = "word") |> 
+  group_by(id) |> 
+  summarize(afinn_title = sum(value, na.rm = TRUE))
+
+# Merge sentiment score with the original dataset
+movie_data <- movie_data |> 
+  left_join(titles_sentiment, by = "id") |> 
+  relocate(afinn_title, .after = nmb_wrd_title) |>
+  mutate(afinn_title = replace_na(afinn_title, 0))
+
+# Remove temporary datasets
+rm(afinn)
+rm(titles_sentiment)
+```
+
+### Budget & Revenue
+
+Regarding the budget and revenue variables, we will not perform many
+manipulations. Specifically, for the revenue variable, we have only
+excluded values equal to zero, while for the budget variable, we have
+removed all films with a budget of less than \$6000 from the dataset.
+Consequently, we will create a new variable that represents the **ratio
+between the film’s revenue and its budget**.
+
+```{r}
+# Calculate revenue to budget ratio
+movie_data <- movie_data |> 
+  mutate(rev_bud_ratio = revenue / budget) |> 
+  relocate(rev_bud_ratio, .after = revenue)
+
+# Round the revenue to budget ratio to 2 decimal places
+movie_data$rev_bud_ratio <- round(movie_data$rev_bud_ratio, 2)
+```
+
+### Date
+
+Regarding the date variable, it was manipulated at the beginning of the
+process, creating two new columns: one for the year and one for the
+month.
+
+### Votes & Popularity
+
+For now, we will not modify these variables, as we will use them in the
+future to work with those related to the cast and crew.
+
+### Intellectual Property (IP)
+
+Now we will proceed to create a variable related to intellectual
+properties. This variable will take the value **1** if the film is
+based, for example, on a **book or a video game**, while it will take
+the value **0** if it is a **completely original idea**. To do this, we
+have identified all possible roles in the `jobs` column that indicate
+the presence of a source on which the film is based.
+
+```{r}
+# list of IP (Intellectual Property) roles
+ip_roles <- c("Author", "Book", "Comic Book", "Graphic Novel", "Graphic Novel Illustrator", "Idea", "Novel", "Original Concept", "Original Film Writer", "Original Series Creator", "Original Series Design", "Original Story", "Poem", "Radio Play", "Scenario Writer", "Short Story", "Theatre Play", "Video Game")
+
+# Create new IP column based on job roles
+movie_data <- movie_data |> 
+  mutate(IP = sapply(strsplit(jobs, ", "), function(x) {
+    if(any(x %in% ip_roles)) 1 else 0
+  })) |> 
+  relocate(IP, .after = month)
+
+# Remove ip_roles list
+rm(ip_roles)
+```
+
+### Overview
+
+Regarding the `overview` variable, which contains the summaries of each
+film’s plot, we will perform a **sentiment analysis**. For this
+analysis, we will use the same approach employed for the sentiment
+analysis of the titles, namely the AFINN lexicon. The result of this
+analysis will be a new variable that contains the sentiment score for
+each film’s plot.
+
+```{r}
+# Load the Afinn sentiment lexicon
+afinn <- get_sentiments("afinn")
+  
+# Calculate sentiment score for each movie overview
+overview_sentiment <- movie_data |> 
+  unnest_tokens(word, overview) |> 
+  inner_join(afinn, by = "word") |> 
+  group_by(id) |> 
+  summarize(overview_sentiment = sum(value, na.rm = TRUE))
+
+# Merge overview sentiment score with the original dataset
+movie_data <- movie_data |> 
+  left_join(overview_sentiment, by = "id") |> 
+  mutate(overview_sentiment = replace_na(overview_sentiment, 0)) |> 
+  relocate(overview_sentiment, .after = overview)
+
+# Remove temporary datasets
+rm(overview_sentiment)
+rm(afinn)
+```
+
+### Original Language
+
+Now we will proceed with the manipulation of the `original_language`
+variable. This column contains many unique values (e.g., “en”, “de”,
+“es”, etc.). To make our analysis more manageable, we will give
+particular emphasis to films that have English as their original
+language. Therefore, we will ensure that this column takes the value
+**1** if the original language of the film is **English** (“en”) and the
+value **0** if the original language is **different from English**.
+
+```{r}
+# Convert original_language to binary (1 for English, 0 for others)
+movie_data <- movie_data |> 
+  mutate(original_language = ifelse(original_language == "en", 1, 0))
+```
+
+### Tagline
+
+For the `tagline` variable, we will start by creating a new column that
+contains the **number of words** present in the tagline.
+
+```{r}
+# Add column for tagline word count
+movie_data <- movie_data |> 
+  mutate(nmb_wrd_tagline = ifelse(is.na(tagline), 0, sapply(strsplit(as.character(tagline), " "), length))) |> 
+  relocate(nmb_wrd_tagline, .after = tagline)
+```
+
+Next, we will perform a **sentiment analysis** of the `tagline`
+variable, using the same approach employed for previous sentiment
+analyses. In this case as well, the result will be a new variable that
+contains the score associated with each tagline.
+
+```{r}
+# Caricare il lexicon Afinn
+afinn <- get_sentiments("afinn")
+# Calcolare il punteggio di sentimento per ciascuna tagline
+tagline_sentiment <- movie_data |> 
+  unnest_tokens(word, tagline) |> 
+  inner_join(afinn, by = "word") |> 
+  group_by(id) |> 
+  summarize(tagline_afinn = sum(value, na.rm = TRUE))
+# Unire il punteggio di sentimento al dataset originale
+movie_data <- movie_data |> 
+  left_join(tagline_sentiment, by = "id") |> 
+  relocate(tagline_afinn, .after = nmb_wrd_tagline) |> 
+  mutate(tagline_afinn = replace_na(tagline_afinn,0))
+# Rimuovere i dataset creati
+rm(afinn)
+rm(tagline_sentiment)
+```
+
+### Keywords
+
+We will not perform any manipulations or analyses on the `keywords`
+variable, as it will be **subsequently removed** from the dataset. This
+variable is not considered very important, as the information contained
+in the title, overview, and tagline is already sufficiently
+representative and includes the data found in the keywords variable.
+
+### Collection
+
+For collections, we will assign a value of **1** to films that are
+**part of a collection** and a value of **0** to **those that are not**.
+In the future, this variable could be treated more thoroughly by
+assigning a weight to the saga (for example, calculating the average
+revenue of the saga) and determining the number of films in the saga to
+which the film in question belongs.
+
+```{r}
+# Convert 'belongs_to_collection' to binary (1 if present, 0 if not)
+movie_data <- movie_data |> 
+  mutate(belongs_to_collection = 
+           ifelse(belongs_to_collection == is.na(belongs_to_collection), 0, 1)) |> 
+  mutate(belongs_to_collection = replace_na(belongs_to_collection, 0))
+```
+
+### Genres
+
+Now we will proceed to create **dummy variables** for the genres. The
+first step is to create a list of all the unique genres present in the
+dataset.
+
+```{r}
+# Extract unique genres from the 'genres' column
+all_genres <- unique(unlist(str_split(movie_data$genres, ", ")))
+```
+
+Once this step is completed, we will create a **separate column** for
+each genre.
+
+```{r}
+# Create binary columns for each genre
+for(genre in all_genres) {
+  movie_data[[genre]] <- as.integer(str_detect(movie_data$genres, fixed(genre)))
+}
+
+# Clean up temporary variables
+rm(all_genres)
+rm(genre)
+```
+
+### Production Companies
+
+The variable related to production companies will subsequently be
+removed from the dataset. Although it is possible to conduct an analysis
+similar to that planned for the actors, this would significantly
+increase the complexity of the analysis without providing a proportional
+benefit. Therefore, we consider it appropriate to **eliminate** this
+variable at a later stage.
+
+### Production Countries
+
+In this case as well, we perform an operation similar to the one done
+for the original language. If the film has ***United States of
+America*** as its country of production, the value will be **1**;
+otherwise, the value will be **0**.
+
+```{r}
+# Convert 'production_countries' to binary (1 if USA, 0 if not)
+movie_data$production_countries <- as.integer(str_detect(movie_data$production_countries, fixed("United States of America")))
+```
+
+### Spoken Languages
+
+The first operation we will perform regarding the variable
+`spoken_languages` will be the creation of a new column. This column
+will contain the **number of languages spoken** in the film.
+
+```{r}
+# Count number of spoken languages
+movie_data <- movie_data |> 
+  mutate(nmb_spoken_languages = case_when(
+    spoken_languages == "No Language" ~ 0, 
+    TRUE ~ str_count(spoken_languages, ",") + 1
+  )) |> 
+  relocate(nmb_spoken_languages, .after = original_language)
+
+# The function str_count(spoken_languages, ",") counts the number of commas in the string. However, the number of languages is always one more than the number of commas. Here’s why: If there is only one language, there are no commas. E.g.: ‘English’ (1 language, 0 commas). If there are two languages, there is one comma. E.g.: ‘English, French’ (2 languages, 1 comma). If there are three languages, there are two commas. E.g.: ‘English, French, German’ (3 languages, 2 commas).
+```
+
+Now, we will follow the same logic used for production companies, but
+instead of considering *United States of America*, we will consider
+***English***.
+
+```{r}
+# Convert 'spoken_languages' to binary (1 if English, 0 if not)
+movie_data$spoken_languages <- as.integer(str_detect(movie_data$spoken_languages, fixed("English")))
+
+movie_data <- movie_data |> 
+  relocate(spoken_languages, .after = original_language)
+```
+
+### Cast
+
+The `cast` column contains, in most cases, all the actors who
+participated in a given film. After a check, we noticed that the actors
+are listed in order of screen time. Therefore, the first name in the
+*cast* column of a film indicates the lead actor, followed by the other
+actors in order of importance. The analysis we will perform will consist
+of creating **two new columns**: the first will contain the name of the
+**lead actor**, while the second will contain the name of the **second
+most relevant actor**.
+
+```{r}
+# Extract first two actors (stars) from the 'cast' column
+movie_data <- movie_data |> 
+  mutate(
+    cast_list = strsplit(cast, ", "),
+    Star1 = sapply(cast_list, function(x) if(length(x) >= 1) x[1] else NA_character_),
+    Star2 = sapply(cast_list, function(x) if(length(x) >= 2) x[2] else NA_character_)
+  ) |> 
+  select(-cast_list)
+```
+
+Now we will proceed in the same way, but this time, instead of focusing
+on the names, we will focus on the **gender** of the two main actors.
+
+```{r}
+# Extract genders for the first two stars
+movie_data <- movie_data |> 
+  mutate(
+    gender_list = strsplit(cast_genders, ", "),
+    Star_gender1 = sapply(gender_list, function(x) if(length(x) >= 1) x[1] else NA_character_),
+    Star_gender2 = sapply(gender_list, function(x) if(length(x) >= 2) x[2] else NA_character_)
+  ) |> 
+  select(-gender_list) |> 
+  relocate(Star_gender1, .after = Star1) |> 
+  relocate(Star_gender2, .after = Star2)
+
+movie_data <- movie_data |> 
+  filter(!is.na(Star_gender2))
+```
+
+However, we want the **two main actors** to be represented in the
+dataset in **numerical form** rather than as names. Therefore, we will
+transform the names by replacing them with the **average box office
+earnings** of the films each actor has participated in up to a certain
+date. Additionally, to give weight to the role assumed by the actor, the
+average will be **weighted**: if the actor was not the main protagonist
+but the second most important, we will multiply the box office by 0.75.
+
+```{r}
+  # Convert release_date to a date format
+  movie_data <- movie_data |> 
+    mutate(release_date = ymd(release_date))
+  
+  # Function to calculate the weighted average revenue for an actor
+  calc_weighted_revenue <- function(actor, date, dataset, is_star1) {
+    relevant_movies <- dataset |> 
+      filter((Star1 == actor | Star2 == actor) & release_date < date) |> 
+      mutate(weight = case_when(
+        Star1 == actor & is_star1 ~ 1, # Full weight if the actor is Star1 and we're calculating for Star1
+        Star2 == actor & !is_star1 ~ 1, # Full weight if the actor is Star2 and we're calculating for Star2
+        TRUE ~ 0.75 # Partial weight (0.75) for secondary relevance
+      ))
+    
+    # Return 0 if no relevant movies are found
+    if(nrow(relevant_movies) == 0) return(0)
+    
+    # Calculate the weighted sum and average revenue
+    weighted_sum <- sum(relevant_movies$revenue * relevant_movies$weight)
+    total_weight <- sum(relevant_movies$weight)
+    
+    return(weighted_sum / total_weight)
+  }
+  
+  # Apply the calc_weighted_revenue function to each row for both Star1 and Star2
+  movie_data <- movie_data |> 
+    rowwise() |> 
+    mutate(
+      Star1_rev = calc_weighted_revenue(Star1, release_date, movie_data, TRUE),
+      Star2_rev = calc_weighted_revenue(Star2, release_date, movie_data, FALSE)
+    ) |> 
+    ungroup()
+  
+  # Round the revenue estimates for Star1 and Star2
+  movie_data$Star1_rev <- round(movie_data$Star1_rev, 0)
+  movie_data$Star2_rev <- round(movie_data$Star2_rev, 0)
+  
+  # Adjust the column order and remove unnecessary columns
+  movie_data <- movie_data |>
+    select(-c(Star1, Star2)) |>
+    relocate(Star1_rev, .after = `TV Movie`) |>
+    relocate(Star2_rev, .after = Star_gender1)
+  
+  # Clean up temporary objects
+  rm(calc_weighted_revenue)
+```
+
+Now we do the same, but for `vote_average` variable.
+
+```{r}
+# Extract first two actors (stars) from the 'cast' column
+movie_data <- movie_data |> 
+  mutate(
+    cast_list = strsplit(cast, ", "),
+    Star1 = sapply(cast_list, function(x) if(length(x) >= 1) x[1] else NA_character_),
+    Star2 = sapply(cast_list, function(x) if(length(x) >= 2) x[2] else NA_character_)
+  ) |> 
+  select(-cast_list)
+
+movie_data <- movie_data |> 
+  filter(!is.na(movie_data$vote_average)) |> 
+  filter(!is.na(movie_data$popularity))
+# Convert release_date to a date format
+  movie_data <- movie_data |> 
+    mutate(release_date = ymd(release_date))
+  
+  # Function to calculate the weighted average vote for an actor
+  calc_weighted_vote <- function(actor, date, dataset, is_star1) {
+    relevant_movies <- dataset |> 
+      filter((Star1 == actor | Star2 == actor) & release_date < date) |> 
+      mutate(weight = case_when(
+        Star1 == actor & is_star1 ~ 1, # Full weight if the actor is Star1 and we're calculating for Star1
+        Star2 == actor & !is_star1 ~ 1, # Full weight if the actor is Star2 and we're calculating for Star2
+        TRUE ~ 0.75 # Partial weight (0.75) for secondary relevance
+      ))
+    
+    # Return 0 if no relevant movies are found
+    if(nrow(relevant_movies) == 0) return(0)
+    
+    # Calculate the weighted sum and average vote
+    weighted_sum <- sum(relevant_movies$vote_average * relevant_movies$weight)
+    total_weight <- sum(relevant_movies$weight)
+    
+    return(weighted_sum / total_weight)
+  }
+  
+  # Apply the calc_weighted_vote function to each row for both Star1 and Star2
+  movie_data <- movie_data |> 
+    rowwise() |> 
+    mutate(
+      Star1_vote = calc_weighted_vote(Star1, release_date, movie_data, TRUE),
+      Star2_vote = calc_weighted_vote(Star2, release_date, movie_data, FALSE)
+    ) |> 
+    ungroup()
+  
+  # Round the vote estimates for Star1 and Star2
+  movie_data$Star1_vote <- round(movie_data$Star1_vote, 2)
+  movie_data$Star2_vote <- round(movie_data$Star2_vote, 2)
+  
+  # Adjust the column order and remove unnecessary columns
+  movie_data <- movie_data |>
+    select(-c(Star1, Star2)) |>
+    relocate(Star1_vote, .after = `Star1_rev`) |>
+    relocate(Star2_vote, .after = Star2_rev)
+  
+  # Clean up temporary objects
+  rm(calc_weighted_vote)
+```
+
+And the same for the `popularity` variable
+
+```{r}
+# Extract first two actors (stars) from the 'cast' column
+movie_data <- movie_data |> 
+  mutate(
+    cast_list = strsplit(cast, ", "),
+    Star1 = sapply(cast_list, function(x) if(length(x) >= 1) x[1] else NA_character_),
+    Star2 = sapply(cast_list, function(x) if(length(x) >= 2) x[2] else NA_character_)
+  ) |> 
+  select(-cast_list)
+
+# Convert release_date to a date format
+  movie_data <- movie_data |> 
+    mutate(release_date = ymd(release_date))
+  
+  # Function to calculate the weighted average popularity for an actor
+  calc_weighted_pop <- function(actor, date, dataset, is_star1) {
+    relevant_movies <- dataset |> 
+      filter((Star1 == actor | Star2 == actor) & release_date < date) |> 
+      mutate(weight = case_when(
+        Star1 == actor & is_star1 ~ 1, # Full weight if the actor is Star1 and we're calculating for Star1
+        Star2 == actor & !is_star1 ~ 1, # Full weight if the actor is Star2 and we're calculating for Star2
+        TRUE ~ 0.75 # Partial weight (0.75) for secondary relevance
+      ))
+    
+    # Return 0 if no relevant movies are found
+    if(nrow(relevant_movies) == 0) return(0)
+    
+    # Calculate the weighted sum and average popularity
+    weighted_sum <- sum(relevant_movies$popularity * relevant_movies$weight)
+    total_weight <- sum(relevant_movies$weight)
+    
+    return(weighted_sum / total_weight)
+  }
+  
+  # Apply the calc_weighted_popularity function to each row for both Star1 and Star2
+  movie_data <- movie_data |> 
+    rowwise() |> 
+    mutate(
+      Star1_pop = calc_weighted_pop(Star1, release_date, movie_data, TRUE),
+      Star2_pop = calc_weighted_pop(Star2, release_date, movie_data, FALSE)
+    ) |> 
+    ungroup()
+  
+  # Round the popularuty estimates for Star1 and Star2
+  movie_data$Star1_pop <- round(movie_data$Star1_pop, 3)
+  movie_data$Star2_pop <- round(movie_data$Star2_pop, 3)
+  
+  # Adjust the column order and remove unnecessary columns
+  movie_data <- movie_data |>
+    select(-c(Star1, Star2)) |>
+    relocate(Star1_pop, .after = `Star1_vote`) |>
+    relocate(Star2_pop, .after = Star2_vote)
+  
+  # Clean up temporary objects
+  rm(calc_weighted_pop)
+```
+
+### Crew
+
+Similarly to what was done for the cast, numerous crew members with
+their respective roles are listed in the `jobs` column for each film. We
+have therefore decided to select the roles that can be considered most
+relevant to the production of a film and that are also more widely known
+to the general public, thus influencing the attendance in cinemas.
+Specifically, we have decided to create new columns for the following
+roles: *Director* and *Screenwriter* (*Screenplay variable*).
+
+```{r}
+# Define roles to extract 
+roles <- c("Director", "Screenplay")
+
+# Function to extract names and genders for a specific role
+extract_role <- function(crew, jobs, genders, role) {
+  crew_list <- strsplit(crew, ", ")
+  jobs_list <- strsplit(jobs, ", ")
+  genders_list <- strsplit(genders, ", ")
+  
+   # Extract names and genders based on matching roles
+  names <- sapply(seq_along(crew_list), function(i) {
+    paste(crew_list[[i]][jobs_list[[i]] == role], collapse = ", ")
+  })
+  
+  genders <- sapply(seq_along(crew_list), function(i) {
+    paste(genders_list[[i]][jobs_list[[i]] == role], collapse = ", ")
+  })
+  
+  list(names = names, genders = genders)
+}
+
+# Apply the extract_role function to each specified role
+new_columns <- lapply(roles, function(role) {
+  result <- extract_role(movie_data$crew, movie_data$jobs, movie_data$crew_genders, role)
+  new_df <- data.frame(
+    names = result$names,
+    genders = result$genders
+  )
+  names(new_df) <- c(role, paste0(role, "_gender"))
+  new_df
+})
+
+# Combine the results into a single data frame
+new_data <- do.call(cbind, new_columns)
+
+# Add the new columns to the original dataset
+movie_data <- cbind(movie_data, new_data)
+
+# Clean up temporary objects
+rm(new_data)
+rm(new_columns)
+rm(extract_role)
+```
+
+In this case as well, we will transform the names of the crew members
+into **numerical values**, using the same approach adopted for the
+actors.
+
+```{r}
+# Function to calculate the average revenue for a person in a specific role
+calc_avg_revenue <- function(person, date, dataset, role) {
+  relevant_movies <- dataset %>%
+    filter(str_detect(!!sym(role), person) & release_date < date)
+  
+  # Return 0 if no relevant movies are found
+  if(nrow(relevant_movies) == 0) return(0)
+  
+  return(mean(relevant_movies$revenue))
+}
+
+# Function to apply calc_avg_revenue for all names in a string
+calc_role_revenue <- function(names, date, dataset, role) {
+  if (is.na(names) || names == "") return(0)
+  
+  people <- str_split(names, ",\\s*")[[1]]
+  revenues <- sapply(people, function(p) calc_avg_revenue(p, date, dataset, role))
+  return(mean(revenues))
+}
+
+# List of roles to apply the revenue calculation
+roles <- c("Director", "Screenplay")
+
+# Apply the revenue calculation function to each role for each row
+movie_data <- movie_data %>%
+  rowwise() %>%
+  mutate(across(
+    all_of(roles),
+    ~ calc_role_revenue(., release_date, movie_data, cur_column()),
+    .names = "{.col}_rev"
+  )) %>%
+  ungroup()
+
+# Round the calculated revenue columns
+movie_data$Director_rev <- round(movie_data$Director_rev, 0)
+movie_data$Screenplay_rev <- round(movie_data$Screenplay_rev, 0)
+
+# Adjust column order and remove original role columns
+movie_data <- movie_data |> 
+  relocate(Director_rev, .after = Director) |> 
+  relocate(Screenplay_rev, .after = Screenplay)
+
+# DIRECTOR POPULARITY
+
+# Function to calculate the average revenue for a person in a specific role
+calc_avg_pop <- function(person, date, dataset, role) {
+  relevant_movies <- dataset %>%
+    filter(str_detect(!!sym(role), person) & release_date < date)
+  
+  # Return 0 if no relevant movies are found
+  if(nrow(relevant_movies) == 0) return(0)
+  
+  return(mean(relevant_movies$popularity))
+}
+
+# Function to apply calc_avg_revenue for all names in a string
+calc_role_pop <- function(names, date, dataset, role) {
+  if (is.na(names) || names == "") return(0)
+  
+  people <- str_split(names, ",\\s*")[[1]]
+  popularities <- sapply(people, function(p) calc_avg_pop(p, date, dataset, role))
+  return(mean(popularities))
+}
+
+# List of roles to apply the revenue calculation
+roles <- c("Director", "Screenplay")
+
+# Apply the revenue calculation function to each role for each row
+movie_data <- movie_data %>%
+  rowwise() %>%
+  mutate(across(
+    all_of(roles),
+    ~ calc_role_pop(., release_date, movie_data, cur_column()),
+    .names = "{.col}_pop"
+  )) %>%
+  ungroup()
+
+# Round the calculated revenue columns
+movie_data$Director_pop <- round(movie_data$Director_pop, 3)
+movie_data$Screenplay_pop <- round(movie_data$Screenplay_pop, 3)
+
+# Adjust column order and remove original role columns
+movie_data <- movie_data |> 
+  relocate(Director_pop, .after = Director_rev) |> 
+  relocate(Screenplay_pop, .after = Screenplay_rev)
+
+# DIRECTOR VOTE
+
+# Function to calculate the average revenue for a person in a specific role
+calc_avg_vote <- function(person, date, dataset, role) {
+  relevant_movies <- dataset %>%
+    filter(str_detect(!!sym(role), person) & release_date < date)
+  
+  # Return 0 if no relevant movies are found
+  if(nrow(relevant_movies) == 0) return(0)
+  
+  return(mean(relevant_movies$vote_average))
+}
+
+# Function to apply calc_avg_revenue for all names in a string
+calc_role_vote <- function(names, date, dataset, role) {
+  if (is.na(names) || names == "") return(0)
+  
+  people <- str_split(names, ",\\s*")[[1]]
+  votes <- sapply(people, function(p) calc_avg_vote(p, date, dataset, role))
+  return(mean(votes))
+}
+
+# List of roles to apply the revenue calculation
+roles <- c("Director", "Screenplay")
+
+# Apply the revenue calculation function to each role for each row
+movie_data <- movie_data %>%
+  rowwise() %>%
+  mutate(across(
+    all_of(roles),
+    ~ calc_role_vote(., release_date, movie_data, cur_column()),
+    .names = "{.col}_vote"
+  )) %>%
+  ungroup()
+
+# Round the calculated revenue columns
+movie_data$Director_vote <- round(movie_data$Director_vote, 2)
+movie_data$Screenplay_vote <- round(movie_data$Screenplay_vote, 2)
+
+# Adjust column order and remove original role columns
+movie_data <- movie_data |> 
+  relocate(Director_vote, .after = Director_pop) |> 
+  relocate(Screenplay_vote, .after = Screenplay_pop) |> 
+  select(-c(Director, Screenplay))
+
+# Clean up temporary objects
+rm(calc_avg_revenue)
+rm(calc_role_revenue)
+rm(calc_avg_pop)
+rm(calc_avg_vote)
+rm(calc_role_pop)
+rm(calc_role_vote)
+rm(roles)
+```
+
+Now we remove also the observations where the director gender is
+unknown. Furthermore, we remove the observations where we have more than
+one director.
+
+```{r}
+movie_data <- movie_data |> 
+  filter(!Director_gender == 0) |>
+  filter(!Star_gender1 == 0) |> 
+  filter(!str_detect(Director_gender, ","))
+```
+
+And we want the genders with 0 and 1.
+
+```{r}
+movie_data <- movie_data %>%
+  mutate(
+    Star_gender1 = as.numeric(as.character(Star_gender1)) - 1,
+    Star_gender2 = as.numeric(as.character(Star_gender2)) - 1,
+    Director_gender = as.numeric(as.character(Director_gender)) - 1
+  )
+```
+
+### Original Music
+
+In a film, music plays a fundamental role. In this regard, *George
+Lucas*, director and producer of the *Star Wars saga*, once said: ‘*The
+sound and music are 50% of the entertainment in a movie*’. Indeed, in
+the history of cinema, there are films that we can easily identify
+thanks to their soundtrack, and others that have made clever use of
+non-original songs, increasing the film’s appeal. Therefore, we have
+opted to create a new variable that identifies whether a film features
+original music or not. To do this, we examined which films in the ‘jobs’
+column had the role of ‘Original Music Composer’.
+
+```{r}
+# Create a new column indicating if "Original Music Composer" is present in jobs
+movie_data <- movie_data |> 
+  mutate(original_music = ifelse(grepl("Original Music Composer", jobs), 1, 0))
+```
+
+### CPI Index
+
+Now let’s add a column related to the CPI index. The **CPI (Consumer
+Price Index)** is a measure that reflects the average change over time
+in the prices paid by consumers for a basket of consumer goods and
+services. In practice, the CPI monitors ***inflation***, indicating how
+much the cost of living increases or decreases. This data could be
+useful in our analysis, as we consider cinema to be a non-essential
+service and, therefore, the trend of people going to the cinema could be
+influenced by the economic situation. The CPI data will be collected
+through a web scraping activity on the [Federal Reserve Bank of
+Minneapolis
+website](https://www.minneapolisfed.org/about-us/monetary-policy/inflation-calculator/consumer-price-index-1913-)
+
+```{r}
+# Web scraping: Extract inflation data (CPI) from a website
+link <- "https://www.minneapolisfed.org/about-us/monetary-policy/inflation-calculator/consumer-price-index-1913-"
+
+html_website <- link |> 
+  read_html()
+
+# Extract all tables from the webpage
+all_tables <- html_website |> 
+  html_table()
+
+# Select the first table (CPI data)
+CPI_data <- all_tables[1]
+
+# Convert the CPI data into a data frame
+CPI <- as.data.frame(CPI_data[[1]])
+
+# Clean up temporary objects
+rm(link)
+rm(html_website)
+rm(all_tables)
+rm(CPI_data)
+
+# Rename columns and remove unnecessary columns from the CPI data
+CPI <- CPI |> 
+  rename(year = Year) |> 
+  rename(average_cpi = `Annual Average CPI(-U)`) |> 
+  select(-`Annual Percent Change
+            (rate of inflation)`)
+
+# Join the movie dataset with CPI data based on the year
+movie_data <- movie_data |> 
+  mutate(year = as.integer(year)) |> 
+  left_join(CPI, by = c("year"))
+
+# Clean up the CPI object
+rm(CPI)
+```
+
+### Certification
+
+Now let’s focus on the variable `certification`. This variable refers to
+movie **ratings**, which indicate the appropriate audience for a film,
+taking into account elements such as language, violence, and adult
+content. The ratings present in the dataset are:
+
+-   **G (General Audiences)**: Suitable for all ages, with no
+    inappropriate content.
+
+-   **PG (Parental Guidance Suggested)**: Some content may not be
+    suitable for children; parental supervision is advised.
+
+-   **PG-13 (Parents Strongly Cautioned)**: Some content may be
+    inappropriate for children under 13; strong parental supervision is
+    recommended.
+
+-   **R (Restricted)**: Children under 17 can only watch the film
+    accompanied by an adult due to strong content or mature themes.
+
+-   **NC-17 (Adults Only)**: Not suitable for children under 17; the
+    film contains extremely explicit content.
+
+-   **NR (Not Rated)**: The film has not been officially rated by a
+    rating agency.
+
+As with the actors, we want this variable to be expressed in numerical
+form. Therefore, we will assign a number to each variable.
+
+```{r}
+# Map the certification categories to numerical values using case_when
+movie_data <- movie_data |> 
+  mutate(certification = case_when(
+    certification == "G" ~ 1,
+    certification == "PG" ~ 2,
+    certification == "PG-13" ~ 3,
+    certification == "R" ~ 4,
+    certification == "NC-17" ~ 5,
+    certification == "NR" ~ 6,
+    TRUE ~ NA_real_  # Keep NA values as NA
+  ))
+```
+
+The `certification` variable still contains **NA values**. We will not
+remove the films that have this value in the *certification* variable,
+but we will proceed with an imputation process. However, before
+performing this activity, we will remove some variables from our dataset
+that are no longer of interest.
+
+```{r}
+# Select specific columns and rearrange the dataset, removing unnecessary columns
+movie_data <- movie_data |> 
+  select(-c(id, 
+            original_title, 
+            release_date,
+            vote_count, 
+            vote_average, 
+            popularity,
+            overview,
+            tagline,
+            keywords,
+            genres,
+            production_companies,
+            cast,
+            crew, 
+            jobs, 
+            cast_genders, 
+            crew_genders)) |> 
+  select(title, everything()) # Place 'title' as the first column
+```
+
+Now we can proceed with **handling the missing values**. First, we will
+analyze the distribution of the `certification` variable.
+
+```{r}
+# Plot a histogram to visualize the distribution of the certification variable
+ggplot(movie_data, aes(`certification`)) +
+  geom_histogram(binwidth = 1, color = "blue", fill = "skyblue") +
+  ggtitle("Distribution of the Certification variable") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 18))
+```
+
+After completing this operation, we will select the **variables** that
+we consider **relevant**. These variables will be useful for the
+imputation of the variable in question.
+
+```{r}
+# Rename columns by replacing spaces with underscores for easier access
+colnames(movie_data) <- gsub(" ", "_", colnames(movie_data))
+
+# Prepare the dataset by selecting relevant columns, including genre indicators
+relevant_data <- movie_data |>  
+  select(certification,
+         budget,
+         revenue,
+         runtime,
+         overview_sentiment,
+         tagline_afinn,
+         Comedy,
+         Action,
+         Drama,
+         Thriller,
+         Adventure,
+         Science_Fiction,
+         Animation,
+         Family,
+         Romance,
+         Mystery,
+         Horror,
+         Fantasy,
+         War,
+         Music,
+         Western,
+         History,
+         Documentary,
+         TV_Movie)
+```
+
+After completing this operation, we can use different algorithms to
+perform the imputations. We have chosen to use two algorithms: **CART**
+and **Lasso**.
+
+```{r}
+# Impute missing certification values using the "cart" method (Classification and Regression Trees)
+mice_imputed_cart <- data.frame(
+  original = movie_data$certification,
+  imputed_cart = complete(mice(relevant_data, m=5, method = "cart", seed=123))$certification
+)
+
+# Impute missing certification values using the "lasso.norm" method (LASSO regression)
+mice_imputed_lasso <- data.frame(
+  original = movie_data$certification,
+  imputed_lasso = complete(mice(relevant_data, m=5, method = "lasso.norm", seed=123))$certification
+)
+```
+
+Now we can compare the different distributions resulting from the
+imputations. These distributions will help us choose the best algorithm
+for imputation. The algorithm whose distribution most closely matches
+the original one will be chosen as the imputation algorithm.
+
+```{r}
+# Define variables, titles, and colors for the updated set of distributions
+variables <- c("original", "imputed_cart", "imputed_lasso")
+titles <- c("Distribution of the Certification variable", 
+            "Cart-imputed distribution", 
+            "Lasso-imputed distribution")
+colors_fill <- c("skyblue", "#6a6ad9", "#e65100")
+colors_border <- c("blue", "pink", "#FF00FF")
+
+# Initialize an empty plot list for the new plots
+plots <- list()
+
+# Loop through the variables to create histograms for each distribution
+for (i in 1:length(variables)) {
+  plots[[i]] <- ggplot(data.frame(mice_imputed_cart, mice_imputed_lasso), aes(x = .data[[variables[i]]])) +
+    geom_histogram(binwidth = 1, fill = colors_fill[i], color = colors_border[i], position = "identity", na.rm = TRUE) +
+    ggtitle(titles[i]) +
+    theme_classic()
+}
+
+# Combine the plots into a grid layout for comparison
+plot_grid(plotlist = plots, ncol = 1, nrow = 3)
+```
+
+From the graphs, we can easily see that the best imputation method seems
+to be CART. Therefore, let’s proceed with the imputation of the NA
+values.
+
+```{r}
+# Replace missing values in the original certification column with the CART-imputed values
+imputed_certification <- mice_imputed_cart$imputed_cart
+
+movie_data$certification[is.na(movie_data$certification)] <- imputed_certification[is.na(movie_data$certification)]
+
+# Remove temporary variables and objects to clean up the environment
+rm(mice_imputed_cart)
+rm(mice_imputed_lasso)
+rm(plots)
+rm(relevant_data)
+rm(colors_border)
+rm(colors_fill)
+rm(i)
+rm(titles)
+rm(variables)
+rm(imputed_certification)
+```
+
+We have completed all operations on the variables.
+
+At this point, we can proceed to save the new dataset, which we will use
+for future analyses.
+
+```{r}
+# Save the final dataset to an Excel file
+write.xlsx(movie_data, "movie_data.xlsx", rowNames = FALSE)
+```
